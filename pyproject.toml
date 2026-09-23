@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keyvault-ledger"
+version = "0.1.0"
+description = "Local key vault with an append-only version manifest"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.setuptools]
+packages = ["keyvault_ledger"]
