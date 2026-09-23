@@ -1,9 +1,12 @@
 """Append-only local key vault.
 
 The vault persists an append-only version manifest (``manifest.json``) plus
-one material file per sealed version under ``materials/``.  ``reload()``
-re-reads and validates the whole keyring and swaps the in-memory snapshot
-atomically; readers only ever see a complete old or complete new snapshot.
+one material file per sealed version under ``materials/``.  Revocations live
+in their own append-only journal (``revocations.jsonl``): revoking a version
+only appends a record, never deleting or altering historical material.
+``reload()`` re-reads and validates the whole keyring, journal included, and
+swaps the in-memory snapshot atomically; readers only ever see a complete
+old or complete new snapshot.
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ from pathlib import Path
 
 MANIFEST_NAME = "manifest.json"
 MATERIALS_DIR = "materials"
+REVOCATIONS_NAME = "revocations.jsonl"
 FORMAT_VERSION = 1
 
 _INITIAL_MANIFEST = {"format": FORMAT_VERSION, "keys": {}}
@@ -69,6 +73,11 @@ class Vault:
                 # is gone: that is corruption, not a new vault.
                 raise ValueError(f"manifest missing: {manifest_path}")
             _atomic_write(manifest_path, _dump_manifest(_INITIAL_MANIFEST))
+        journal_path = self._root / REVOCATIONS_NAME
+        if not journal_path.exists():
+            # A vault created before revocations existed simply has an empty
+            # journal; the journal is append-only and never rewritten.
+            _atomic_write(journal_path, b"")
         self._snapshot, self._manifest = self._load_validated()
 
     # ------------------------------------------------------------------
@@ -98,25 +107,41 @@ class Vault:
             )
             digest = hashlib.sha256(material).hexdigest()
 
-            # Write the material first, then flip the manifest.  A crash in
-            # between leaves at most an orphan material file — never a
-            # half-recorded version, because the manifest is the source of
-            # truth and is replaced atomically.
+            # Write the material first, then flip the manifest.  The manifest
+            # is the source of truth and is replaced atomically, so a crash
+            # in between can never expose a half-recorded version; if the
+            # manifest write itself fails, remove the material just written
+            # so a failed seal leaves no orphan behind.
             material_path = self._root / rel_file
             material_path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(material_path, material)
 
-            records.append(
-                {"version": new_version, "sha256": digest, "file": rel_file}
-            )
-            entry["active"] = new_version
-            _atomic_write(self._root / MANIFEST_NAME, _dump_manifest(new_manifest))
+            try:
+                records.append(
+                    {"version": new_version, "sha256": digest, "file": rel_file}
+                )
+                entry["active"] = new_version
+                _atomic_write(self._root / MANIFEST_NAME, _dump_manifest(new_manifest))
+            except BaseException:
+                # ``new_manifest`` is a private deep copy and is simply
+                # discarded; only the material written above needs cleanup.
+                try:
+                    material_path.unlink()
+                except OSError:
+                    pass
+                raise
 
             new_snapshot = {
-                k: {"active": e["active"], "versions": dict(e["versions"])}
+                k: {
+                    "active": e["active"],
+                    "versions": dict(e["versions"]),
+                    "revoked": set(e["revoked"]),
+                }
                 for k, e in self._snapshot.items()
             }
-            slot = new_snapshot.setdefault(key_id, {"active": 0, "versions": {}})
+            slot = new_snapshot.setdefault(
+                key_id, {"active": 0, "versions": {}, "revoked": set()}
+            )
             slot["versions"][new_version] = material
             slot["active"] = new_version
             self._snapshot = new_snapshot
@@ -149,14 +174,98 @@ class Vault:
             raise KeyError(key_id)
         return entry["active"]
 
+    def revoke(self, key_id: str, version: int) -> None:
+        """Mark ``version`` of ``key_id`` as revoked.
+
+        Revocation is an explicit marker only: the version's material stays
+        readable, it stays in the version list, and the active version is
+        unchanged.  The marker is appended to an append-only journal, so it
+        survives a full ``reload()``.
+        """
+        if not isinstance(key_id, str):
+            raise TypeError("key_id must be a string")
+        if key_id == "":
+            raise ValueError("key_id must not be empty")
+        if type(version) is not int:
+            raise TypeError("version must be an int")
+
+        with self._lock:
+            entry = self._snapshot.get(key_id)
+            if entry is None:
+                raise KeyError(key_id)
+            if version not in entry["versions"]:
+                raise KeyError(f"{key_id!r} version {version!r}")
+            if version in entry["revoked"]:
+                raise ValueError(
+                    f"{key_id!r} version {version!r} is already revoked"
+                )
+
+            record = {"key_id": key_id, "version": version}
+            line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            journal_path = self._root / REVOCATIONS_NAME
+            if not journal_path.exists():
+                # The journal is created when the vault opens; its absence
+                # means it was removed out of band.  Recreating it here
+                # would silently drop earlier revocation records.
+                raise ValueError(f"revocation journal missing: {journal_path}")
+            # Append-only: a single write in append mode only adds a record,
+            # never rewriting history.
+            with open(journal_path, "ab") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            new_snapshot = {
+                k: {
+                    "active": e["active"],
+                    "versions": dict(e["versions"]),
+                    "revoked": set(e["revoked"]),
+                }
+                for k, e in self._snapshot.items()
+            }
+            new_snapshot[key_id]["revoked"].add(version)
+            self._snapshot = new_snapshot
+
+    def is_revoked(self, key_id: str, version: int) -> bool:
+        """Return whether ``version`` of ``key_id`` has been revoked."""
+        if not isinstance(key_id, str):
+            raise TypeError("key_id must be a string")
+        if key_id == "":
+            raise ValueError("key_id must not be empty")
+        entry = self._snapshot.get(key_id)
+        if entry is None:
+            raise KeyError(key_id)
+        if type(version) is not int or version not in entry["versions"]:
+            raise KeyError(f"{key_id!r} version {version!r}")
+        return version in entry["revoked"]
+
+    def revoked_versions(self, key_id: str) -> list[int]:
+        """Return the revoked versions of ``key_id``, ascending.
+
+        A key that has never been revoked — including an unknown key —
+        yields an empty list.
+        """
+        if not isinstance(key_id, str):
+            raise TypeError("key_id must be a string")
+        if key_id == "":
+            raise ValueError("key_id must not be empty")
+        entry = self._snapshot.get(key_id)
+        if entry is None:
+            return []
+        return sorted(entry["revoked"])
+
     def reload(self) -> None:
         """Re-read and validate the whole keyring, then swap the snapshot.
 
-        Never writes to disk.  On any validation failure the current
-        in-memory snapshot is kept untouched.
+        Never writes to disk.  The whole read-and-validate pass happens
+        under the lock so it cannot interleave with a seal: swapping in a
+        snapshot read before a concurrent seal completed would resurrect an
+        old snapshot and could later reuse its version numbers.  On any
+        validation failure the current in-memory snapshot is kept
+        untouched.
         """
-        snapshot, manifest = self._load_validated()
         with self._lock:
+            snapshot, manifest = self._load_validated()
             self._snapshot = snapshot
             self._manifest = manifest
 
@@ -182,9 +291,11 @@ class Vault:
     def _load_validated(self) -> tuple[dict, dict]:
         """Read and validate the whole keyring from disk.
 
-        Returns ``(snapshot, manifest)``.  Raises ``ValueError`` if the
-        manifest is missing, corrupt, malformed, or disagrees with the
-        stored material.
+        Returns ``(snapshot, manifest)``.  The snapshot carries each key's
+        materials plus its revoked-version set.  Raises ``ValueError`` if
+        the manifest or the revocation journal is corrupt or malformed, a
+        stored material is missing or mismatches its record, or the
+        journal revokes an unknown/duplicate version.
         """
         manifest_path = self._root / MANIFEST_NAME
         try:
@@ -276,6 +387,67 @@ class Vault:
                     f"manifest format invalid: key {key_id!r} active version "
                     "does not match the latest sealed version"
                 )
-            snapshot[key_id] = {"active": active, "versions": versions}
+            snapshot[key_id] = {
+                "active": active,
+                "versions": versions,
+                "revoked": set(),
+            }
 
+        self._load_revocations(snapshot)
         return snapshot, manifest
+
+    def _load_revocations(self, snapshot: dict[str, dict]) -> None:
+        """Validate the append-only revocation journal against ``snapshot``.
+
+        Populates each snapshot entry's ``revoked`` set in place.  Raises
+        ``ValueError`` if the journal is missing, holds a malformed record,
+        revokes an unknown key/version, or revokes the same version twice.
+        """
+        journal_path = self._root / REVOCATIONS_NAME
+        try:
+            raw = journal_path.read_bytes()
+        except FileNotFoundError as exc:
+            raise ValueError(f"revocation journal missing: {journal_path}") from exc
+        except OSError as exc:
+            raise ValueError(f"revocation journal unreadable: {exc}") from exc
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"revocation journal corrupt: {exc}") from exc
+
+        seen: set[tuple[str, int]] = set()
+        for line in text.splitlines():
+            if not line:
+                raise ValueError("revocation journal corrupt: empty record")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"revocation journal corrupt: {exc}") from exc
+            if not isinstance(record, dict):
+                raise ValueError("revocation journal corrupt: record not an object")
+            key_id = record.get("key_id")
+            version = record.get("version")
+            if not isinstance(key_id, str) or key_id == "":
+                raise ValueError(
+                    "revocation journal corrupt: record has bad key_id"
+                )
+            if type(version) is not int:
+                raise ValueError(
+                    f"revocation journal corrupt: key {key_id!r} record has "
+                    "bad version"
+                )
+            entry = snapshot.get(key_id)
+            if entry is None or version not in entry["versions"]:
+                raise ValueError(
+                    f"revocation journal corrupt: key {key_id!r} version "
+                    f"{version} was never sealed"
+                )
+            marker = (key_id, version)
+            if marker in seen:
+                raise ValueError(
+                    f"revocation journal corrupt: key {key_id!r} version "
+                    f"{version} revoked more than once"
+                )
+            seen.add(marker)
+            entry["revoked"].add(version)
