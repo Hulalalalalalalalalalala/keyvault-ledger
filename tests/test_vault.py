@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from keyvault_ledger import Vault
 from keyvault_ledger.vault import (
+    LOCK_NAME,
     MANIFEST_NAME,
     MATERIALS_DIR,
     REVOCATIONS_NAME,
@@ -24,6 +26,25 @@ from keyvault_ledger.vault import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _seal_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
+    vault = Vault(root)
+    for payload in payloads:
+        vault.seal(key_id, payload)
+
+
+def _reload_worker(root: str, count: int) -> None:
+    vault = Vault(root)
+    for _ in range(count):
+        vault.reload()
+
+
+def _revoke_worker(root: str, key_id: str, versions: list[int]) -> None:
+    vault = Vault(root)
+    for version in versions:
+        vault.revoke(key_id, version)
+        vault.reload()
 
 
 class VaultTestCase(unittest.TestCase):
@@ -643,6 +664,126 @@ class TestSealCleanup(VaultTestCase):
         self.assertEqual(vault.seal("k", b"v3"), 3)
         self.assertEqual(vault.load("k", 2), b"v2")
         self.assertEqual(vault.load("k", 3), b"v3")
+
+
+class TestVersionEntryValidation(VaultTestCase):
+    def test_non_int_version_raises_type_error_on_revoke_and_query(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        journal_before = self.journal_path().read_bytes()
+        for bad in (1.0, 2.5, True, False, "1", None, (1,)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.revoke("k", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.is_revoked("k", bad)
+        # Rejected versions never reach the append-only journal and the
+        # in-memory markers are untouched.
+        self.assertEqual(self.journal_path().read_bytes(), journal_before)
+        self.assertEqual(vault.revoked_versions("k"), [])
+        self.assertFalse(vault.is_revoked("k", 1))
+
+    def test_non_int_version_rejected_even_for_unknown_key(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        # Entry validation fires before any key lookup.
+        with self.assertRaises(TypeError):
+            vault.is_revoked("never-sealed", 1.5)
+        with self.assertRaises(TypeError):
+            vault.revoke("never-sealed", True)
+
+
+class TestMultiProcess(VaultTestCase):
+    def _run_workers(self, workers: list[multiprocessing.Process]) -> None:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=120)
+            self.assertEqual(worker.exitcode, 0)
+
+    def test_concurrent_seals_allocate_unique_contiguous_versions(self):
+        procs, seals_each = 4, 5
+        payloads = {
+            (p, i): f"proc-{p}-seal-{i}".encode("utf-8")
+            for p in range(procs)
+            for i in range(seals_each)
+        }
+        workers = [
+            multiprocessing.Process(
+                target=_seal_worker,
+                args=(
+                    str(self.root),
+                    "shared",
+                    [payloads[(p, i)] for i in range(seals_each)],
+                ),
+            )
+            for p in range(procs)
+        ]
+        # Reloaders run alongside: every reload must see either the
+        # complete old records or the complete newly persisted ones —
+        # a torn read would fail validation and exit non-zero.
+        workers += [
+            multiprocessing.Process(target=_reload_worker, args=(str(self.root), 20))
+            for _ in range(2)
+        ]
+        self._run_workers(workers)
+
+        vault = self.open_vault()
+        total = procs * seals_each
+        # No duplicated, skipped or reused version numbers.
+        self.assertEqual(vault.versions("shared"), list(range(1, total + 1)))
+        self.assertEqual(vault.active("shared"), total)
+        # Every sealed payload landed exactly once, byte for byte.
+        self.assertEqual(
+            {vault.load("shared", v) for v in range(1, total + 1)},
+            set(payloads.values()),
+        )
+        vault.reload()
+        self.assertEqual(vault.versions("shared"), list(range(1, total + 1)))
+
+    def test_concurrent_revokes_and_reloads_keep_journal_consistent(self):
+        vault = self.open_vault()
+        total = 12
+        for i in range(total):
+            vault.seal("k", f"m-{i}".encode("utf-8"))
+
+        procs = 3
+        workers = [
+            multiprocessing.Process(
+                target=_revoke_worker,
+                args=(
+                    str(self.root),
+                    "k",
+                    [v for v in range(1, total + 1) if v % procs == p],
+                ),
+            )
+            for p in range(procs)
+        ]
+        self._run_workers(workers)
+
+        # The journal only grew: one well-formed record per version.
+        records = self.journal_records()
+        self.assertEqual(len(records), total)
+        self.assertEqual(
+            sorted(record["version"] for record in records),
+            list(range(1, total + 1)),
+        )
+        self.assertTrue(all(record["key_id"] == "k" for record in records))
+
+        reloaded = self.open_vault()
+        self.assertEqual(reloaded.revoked_versions("k"), list(range(1, total + 1)))
+        # Historical material was never overwritten or truncated.
+        for i in range(1, total + 1):
+            self.assertEqual(reloaded.load("k", i), f"m-{i - 1}".encode("utf-8"))
+
+    def test_lock_file_is_not_vault_content(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        self.assertTrue((self.root / LOCK_NAME).exists())
+        # The lock file shows up neither as a key nor in validation.
+        self.assertEqual(set(vault.manifest()["keys"]), {"k"})
+        self.assertEqual(vault.versions("k"), [1])
+        vault.reload()
+        self.assertEqual(vault.load("k"), b"m")
 
 
 class TestCli(VaultTestCase):

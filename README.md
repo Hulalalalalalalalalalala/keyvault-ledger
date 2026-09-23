@@ -40,14 +40,29 @@ marker survives a full `reload()`, which validates the manifest, every
 material, and the journal together before swapping its in-memory snapshot.
 
 Each version of a key can be revoked at most once. `revoke` raises
-`ValueError` for an empty key id or a repeated revocation, and `KeyError`
-for a key that was never sealed or a version that does not exist.
-`is_revoked` follows the same rule (empty key id → `ValueError`, unknown
-key or version → `KeyError`); `revoked_versions` returns `[]` for an
-unknown key and raises `ValueError` only for an empty key id.
+`ValueError` for an empty key id or a repeated revocation, `TypeError` for
+a non-integer version (floats, bools, …), and `KeyError` for a key that
+was never sealed or a version that does not exist. `is_revoked` follows
+the same rule (empty key id → `ValueError`, non-integer version →
+`TypeError`, unknown key or version → `KeyError`); `revoked_versions`
+returns `[]` for an unknown key and raises `ValueError` only for an empty
+key id.
 
 The command line keeps its three entry points (`versions`, `seal`,
 `reload`); revocation and its queries are library-only.
+
+### Concurrency
+
+Multiple processes may share one vault directory. Opening, sealing,
+revoking and reloading all run under an exclusive, blocking file lock
+held on `vault.lock` inside the vault directory (standard-library
+`fcntl.flock`, or `msvcrt.locking` on Windows). A writer waits until it
+holds the lock and completes its whole record before releasing it, so
+interleaved seals and revokes from different processes never duplicate or
+skip a version number and never overwrite historical material. A reload
+concurrent with a seal reads either the complete old records or the
+complete newly persisted ones. The lock file is only a mutual-exclusion
+device: it carries no key data and plays no part in validation.
 
 ## Tests
 
@@ -55,6 +70,5 @@ The command line keeps its three entry points (`versions`, `seal`,
 
 ## Limits
 
-Single-process use; no cross-process locking.
 No key derivation: callers supply the material.
 No network service.
