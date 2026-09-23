@@ -1,4 +1,4 @@
-"""Append-only local key vault.
+"""Append-only local key vault, safe for several processes at once.
 
 The vault persists an append-only version manifest (``manifest.json``) plus
 one material file per sealed version under ``materials/``.  Revocations live
@@ -7,12 +7,25 @@ only appends a record, never deleting or altering historical material.
 ``reload()`` re-reads and validates the whole keyring, journal included, and
 swaps the in-memory snapshot atomically; readers only ever see a complete
 old or complete new snapshot.
+
+Multiple processes may work the same vault directory concurrently.  They
+serialise on a lock file (``.vault.lock``) living inside the vault, using
+the standard library's ``fcntl`` advisory locks.  Every transaction — a
+seal, a revoke, or a reload's whole read-and-validate pass — takes the same
+exclusive lock and holds it until the transaction is complete; a caller
+blocked on the lock waits until it gets it.  Because reload reads disk only
+while it alone holds the lock, it sees either the complete pre-write records
+or the complete post-write records, never a torn state.  The lock file is
+only a mutex: it is never validated as vault data and never read as manifest
+or material.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -22,6 +35,7 @@ from pathlib import Path
 MANIFEST_NAME = "manifest.json"
 MATERIALS_DIR = "materials"
 REVOCATIONS_NAME = "revocations.jsonl"
+LOCK_NAME = ".vault.lock"
 FORMAT_VERSION = 1
 
 _INITIAL_MANIFEST = {"format": FORMAT_VERSION, "keys": {}}
@@ -57,6 +71,50 @@ def _dump_manifest(manifest: dict) -> bytes:
     return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
+def _validate_version(version: object) -> int:
+    """The single version-number check shared by every entry point.
+
+    Only a plain ``int`` is a legal version.  Booleans are rejected even
+    though ``bool`` is a subclass of ``int``, and floats or other non-integer
+    values raise ``TypeError`` at the entry point, so an invalid version can
+    never reach the disk records.
+    """
+    if type(version) is not int:
+        raise TypeError("version must be an int")
+    return version
+
+
+class _FileLock:
+    """Blocking advisory exclusive lock on a file in the vault directory.
+
+    The lock coordinates processes; an in-process :class:`threading.Lock`
+    serialises threads within one process.  Every transaction waits (as long
+    as needed) for the exclusive lock and holds it until the transaction is
+    finished, so readers and writers across processes never overlap.  A
+    fresh file descriptor is opened per transaction and closed as soon as
+    the lock is released, so no descriptor is left dangling.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._thread_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def hold(self):
+        with self._thread_lock:
+            fh = open(self._path, "a+b")
+            try:
+                # Block until the lock is held; the holder finishes the
+                # whole transaction before releasing it.
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+
 class Vault:
     """Local key vault rooted at a directory on disk."""
 
@@ -66,19 +124,23 @@ class Vault:
         fresh = not self._root.exists()
         self._root.mkdir(parents=True, exist_ok=True)
         (self._root / MATERIALS_DIR).mkdir(exist_ok=True)
-        manifest_path = self._root / MANIFEST_NAME
-        if not manifest_path.exists():
-            if not fresh and not self._is_fresh_dir():
-                # The directory already holds vault content but the manifest
-                # is gone: that is corruption, not a new vault.
-                raise ValueError(f"manifest missing: {manifest_path}")
-            _atomic_write(manifest_path, _dump_manifest(_INITIAL_MANIFEST))
-        journal_path = self._root / REVOCATIONS_NAME
-        if not journal_path.exists():
-            # A vault created before revocations existed simply has an empty
-            # journal; the journal is append-only and never rewritten.
-            _atomic_write(journal_path, b"")
-        self._snapshot, self._manifest = self._load_validated()
+        # The lock file lives inside the vault and is only a mutex; it is
+        # never treated as key data and takes no part in validation.
+        self._file_lock = _FileLock(self._root / LOCK_NAME)
+        with self._file_lock.hold():
+            manifest_path = self._root / MANIFEST_NAME
+            if not manifest_path.exists():
+                if not fresh and not self._is_fresh_dir():
+                    # The directory already holds vault content but the
+                    # manifest is gone: that is corruption, not a new vault.
+                    raise ValueError(f"manifest missing: {manifest_path}")
+                _atomic_write(manifest_path, _dump_manifest(_INITIAL_MANIFEST))
+            journal_path = self._root / REVOCATIONS_NAME
+            if not journal_path.exists():
+                # A vault created before revocations existed simply has an
+                # empty journal; the journal is append-only and never rewritten.
+                _atomic_write(journal_path, b"")
+            self._snapshot, self._manifest = self._load_validated()
 
     # ------------------------------------------------------------------
     # public interface
@@ -94,13 +156,18 @@ class Vault:
             raise TypeError("material must be a bytes-like object")
         material = bytes(material)
 
-        with self._lock:
-            new_manifest = copy.deepcopy(self._manifest)
-            entry = new_manifest["keys"].setdefault(
-                key_id, {"active": 0, "versions": []}
+        # Hold the cross-process lock for the whole transaction.  Another
+        # process may have sealed versions since this handle last read the
+        # disk, so the next version number is computed from a freshly
+        # validated disk state, never from this process's possibly stale
+        # snapshot: versions can then neither repeat nor skip.
+        with self._file_lock.hold(), self._lock:
+            fresh_snapshot, fresh_manifest = self._load_validated()
+            disk_entry = fresh_manifest["keys"].get(key_id)
+            disk_records = disk_entry["versions"] if disk_entry else []
+            new_version = (
+                disk_records[-1]["version"] + 1 if disk_records else 1
             )
-            records = entry["versions"]
-            new_version = records[-1]["version"] + 1 if records else 1
 
             rel_file = (
                 f"{MATERIALS_DIR}/{_encode_key_id(key_id)}/{new_version}.bin"
@@ -116,8 +183,12 @@ class Vault:
             material_path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write(material_path, material)
 
+            new_manifest = copy.deepcopy(fresh_manifest)
             try:
-                records.append(
+                entry = new_manifest["keys"].setdefault(
+                    key_id, {"active": 0, "versions": []}
+                )
+                entry["versions"].append(
                     {"version": new_version, "sha256": digest, "file": rel_file}
                 )
                 entry["active"] = new_version
@@ -131,20 +202,14 @@ class Vault:
                     pass
                 raise
 
-            new_snapshot = {
-                k: {
-                    "active": e["active"],
-                    "versions": dict(e["versions"]),
-                    "revoked": set(e["revoked"]),
-                }
-                for k, e in self._snapshot.items()
-            }
-            slot = new_snapshot.setdefault(
+            # The validated snapshot mirrors the disk exactly; reflect the
+            # version just appended and publish it with a single assignment.
+            slot = fresh_snapshot.setdefault(
                 key_id, {"active": 0, "versions": {}, "revoked": set()}
             )
             slot["versions"][new_version] = material
             slot["active"] = new_version
-            self._snapshot = new_snapshot
+            self._snapshot = fresh_snapshot
             self._manifest = new_manifest
             return new_version
 
@@ -186,11 +251,14 @@ class Vault:
             raise TypeError("key_id must be a string")
         if key_id == "":
             raise ValueError("key_id must not be empty")
-        if type(version) is not int:
-            raise TypeError("version must be an int")
+        _validate_version(version)
 
-        with self._lock:
-            entry = self._snapshot.get(key_id)
+        # Take the exclusive lock for the whole append, and decide against a
+        # freshly validated disk state: a concurrent process may have sealed
+        # the version in the meantime, or already revoked it.
+        with self._file_lock.hold(), self._lock:
+            fresh_snapshot, fresh_manifest = self._load_validated()
+            entry = fresh_snapshot.get(key_id)
             if entry is None:
                 raise KeyError(key_id)
             if version not in entry["versions"]:
@@ -215,16 +283,11 @@ class Vault:
                 fh.flush()
                 os.fsync(fh.fileno())
 
-            new_snapshot = {
-                k: {
-                    "active": e["active"],
-                    "versions": dict(e["versions"]),
-                    "revoked": set(e["revoked"]),
-                }
-                for k, e in self._snapshot.items()
-            }
-            new_snapshot[key_id]["revoked"].add(version)
-            self._snapshot = new_snapshot
+            # The validated snapshot already mirrors the journal; add the
+            # marker just appended and publish with a single assignment.
+            entry["revoked"].add(version)
+            self._snapshot = fresh_snapshot
+            self._manifest = fresh_manifest
 
     def is_revoked(self, key_id: str, version: int) -> bool:
         """Return whether ``version`` of ``key_id`` has been revoked."""
@@ -232,10 +295,13 @@ class Vault:
             raise TypeError("key_id must be a string")
         if key_id == "":
             raise ValueError("key_id must not be empty")
+        # Same gate as revoke: a non-integer version is a TypeError at the
+        # entry point, before any key lookup.
+        _validate_version(version)
         entry = self._snapshot.get(key_id)
         if entry is None:
             raise KeyError(key_id)
-        if type(version) is not int or version not in entry["versions"]:
+        if version not in entry["versions"]:
             raise KeyError(f"{key_id!r} version {version!r}")
         return version in entry["revoked"]
 
@@ -258,13 +324,13 @@ class Vault:
         """Re-read and validate the whole keyring, then swap the snapshot.
 
         Never writes to disk.  The whole read-and-validate pass happens
-        under the lock so it cannot interleave with a seal: swapping in a
-        snapshot read before a concurrent seal completed would resurrect an
-        old snapshot and could later reuse its version numbers.  On any
-        validation failure the current in-memory snapshot is kept
-        untouched.
+        under the same exclusive cross-process lock (and in-process lock)
+        that every seal and revoke takes, so it cannot interleave with a
+        writer in any process: it observes either the complete pre-write
+        records or the complete post-write records.  On any validation
+        failure the current in-memory snapshot is kept untouched.
         """
-        with self._lock:
+        with self._file_lock.hold(), self._lock:
             snapshot, manifest = self._load_validated()
             self._snapshot = snapshot
             self._manifest = manifest
@@ -279,6 +345,9 @@ class Vault:
 
     def _is_fresh_dir(self) -> bool:
         for child in self._root.iterdir():
+            if child.name == LOCK_NAME:
+                # The mutex file is coordination state, not key data.
+                continue
             if (
                 child.name == MATERIALS_DIR
                 and child.is_dir()
