@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -23,6 +25,8 @@ from keyvault_ledger.vault import (
     MATERIALS_DIR,
     REVOCATIONS_NAME,
     _atomic_write,
+    _derive_material,
+    _dump_manifest,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -775,6 +779,54 @@ class TestMultiProcess(VaultTestCase):
         for i in range(1, total + 1):
             self.assertEqual(reloaded.load("k", i), f"m-{i - 1}".encode("utf-8"))
 
+    def test_concurrent_seals_and_derive_seals_share_one_sequence(self):
+        seal_procs, each = 3, 4
+        workers = [
+            multiprocessing.Process(
+                target=_seal_worker,
+                args=(
+                    str(self.root),
+                    "shared",
+                    [f"seal-{p}-{i}".encode() for i in range(each)],
+                ),
+            )
+            for p in range(seal_procs)
+        ]
+        workers += [
+            multiprocessing.Process(
+                target=_derive_worker,
+                args=(
+                    str(self.root),
+                    "shared",
+                    [f"pw-{p}-{i}".encode() for i in range(each)],
+                ),
+            )
+            for p in range(2)
+        ]
+        self._run_workers(workers)
+
+        total = (seal_procs + 2) * each
+        vault = self.open_vault()
+        # Derived and plain seals draw from one non-repeating sequence.
+        self.assertEqual(vault.versions("shared"), list(range(1, total + 1)))
+        self.assertEqual(vault.active("shared"), total)
+        seal_payloads = {
+            f"seal-{p}-{i}".encode()
+            for p in range(seal_procs)
+            for i in range(each)
+        }
+        derived_payloads = {
+            hashlib.pbkdf2_hmac(
+                "sha256", f"pw-{p}-{i}".encode(), b"worker-salt", 100, dklen=16
+            )
+            for p in range(2)
+            for i in range(each)
+        }
+        self.assertEqual(
+            {vault.load("shared", v) for v in range(1, total + 1)},
+            seal_payloads | derived_payloads,
+        )
+
     def test_lock_file_is_not_vault_content(self):
         vault = self.open_vault()
         vault.seal("k", b"m")
@@ -784,6 +836,455 @@ class TestMultiProcess(VaultTestCase):
         self.assertEqual(vault.versions("k"), [1])
         vault.reload()
         self.assertEqual(vault.load("k"), b"m")
+
+
+def _derive_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
+    vault = Vault(root)
+    salt = b"worker-salt"
+    for i, payload in enumerate(payloads):
+        vault.derive_seal(key_id, payload, salt, 100, 16)
+
+
+class TestDeriveSeal(VaultTestCase):
+    PASSWORD = b"correct horse battery staple"
+    SALT = b"\x00\x01\x02 salty bytes \xff"
+    ITERATIONS = 2000
+    LENGTH = 48
+
+    def test_derive_seal_returns_next_version_alongside_plain_seals(self):
+        vault = self.open_vault()
+        self.assertEqual(vault.seal("k", b"plain-one"), 1)
+        self.assertEqual(
+            vault.derive_seal("k", self.PASSWORD, self.SALT, self.ITERATIONS, 16),
+            2,
+        )
+        self.assertEqual(vault.seal("k", b"plain-two"), 3)
+        self.assertEqual(vault.versions("k"), [1, 2, 3])
+        self.assertEqual(vault.active("k"), 3)
+
+    def test_stored_material_is_pbkdf2_output_byte_for_byte(self):
+        vault = self.open_vault()
+        version = vault.derive_seal(
+            "k", self.PASSWORD, self.SALT, self.ITERATIONS, self.LENGTH
+        )
+        expected = hashlib.pbkdf2_hmac(
+            "sha256", self.PASSWORD, self.SALT, self.ITERATIONS, dklen=self.LENGTH
+        )
+        self.assertEqual(vault.load("k", version), expected)
+        self.assertEqual(len(vault.load("k", version)), self.LENGTH)
+
+    def test_readback_matches_fresh_rederivation_with_same_parameters(self):
+        vault = self.open_vault()
+        vault.derive_seal(
+            "k", self.PASSWORD, self.SALT, self.ITERATIONS, self.LENGTH
+        )
+        # No version: the active version is queried and re-derived.
+        record = vault.derivation("k")
+        rederived = hashlib.pbkdf2_hmac(
+            "sha256",
+            self.PASSWORD,
+            record["salt"],
+            record["iterations"],
+            dklen=record["length"],
+        )
+        self.assertEqual(vault.load("k"), rederived)
+
+    def test_derivation_returns_salt_iterations_and_length(self):
+        vault = self.open_vault()
+        version = vault.derive_seal(
+            "k", self.PASSWORD, self.SALT, self.ITERATIONS, self.LENGTH
+        )
+        self.assertEqual(
+            vault.derivation("k", version),
+            {"salt": self.SALT, "iterations": self.ITERATIONS, "length": self.LENGTH},
+        )
+        # Defaults to the active version.
+        self.assertEqual(vault.derivation("k"), vault.derivation("k", version))
+
+    def test_directly_sealed_version_has_empty_derivation_record(self):
+        vault = self.open_vault()
+        vault.seal("k", b"plain")
+        self.assertEqual(vault.derivation("k"), {})
+        vault.derive_seal("k", self.PASSWORD, self.SALT, 100, 16)
+        # The derived version keeps its record; the plain one stays empty.
+        self.assertEqual(vault.derivation("k", 1), {})
+        self.assertTrue(vault.derivation("k", 2))
+        # Active is the derived version now.
+        self.assertEqual(vault.derivation("k")["iterations"], 100)
+
+    def test_derivation_persists_through_reload_and_reopen(self):
+        vault = self.open_vault()
+        version = vault.derive_seal(
+            "k", self.PASSWORD, self.SALT, self.ITERATIONS, self.LENGTH
+        )
+        vault.reload()
+        self.assertEqual(
+            vault.derivation("k", version)["salt"], self.SALT
+        )
+        reopened = self.open_vault()
+        record = reopened.derivation("k", version)
+        self.assertEqual(
+            record,
+            {"salt": self.SALT, "iterations": self.ITERATIONS, "length": self.LENGTH},
+        )
+        expected = hashlib.pbkdf2_hmac(
+            "sha256", self.PASSWORD, self.SALT, self.ITERATIONS, dklen=self.LENGTH
+        )
+        self.assertEqual(reopened.load("k", version), expected)
+
+    def test_derivation_returns_a_copy(self):
+        vault = self.open_vault()
+        vault.derive_seal("k", self.PASSWORD, self.SALT, 100, 16)
+        record = vault.derivation("k")
+        record["salt"] = b"tampered"
+        record["iterations"] = 1
+        self.assertEqual(vault.derivation("k")["salt"], self.SALT)
+        self.assertEqual(vault.derivation("k")["iterations"], 100)
+
+    def test_passphrase_never_reaches_disk(self):
+        vault = self.open_vault()
+        secret = b"a-passphrase-nobody-should-ever-see"
+        vault.derive_seal("k", secret, self.SALT, 100, 32)
+        for path in self.root.rglob("*"):
+            if path.is_file() and path.name != LOCK_NAME:
+                self.assertNotIn(secret, path.read_bytes())
+
+    def test_derivation_parameters_travel_with_manifest_record(self):
+        vault = self.open_vault()
+        vault.derive_seal("k", self.PASSWORD, self.SALT, 1234, 24)
+        import base64
+
+        record = self.disk_manifest()["keys"]["k"]["versions"][0]["derivation"]
+        self.assertEqual(
+            record,
+            {
+                "salt": base64.b64encode(self.SALT).decode("ascii"),
+                "iterations": 1234,
+                "length": 24,
+            },
+        )
+
+
+class TestDerivationErrors(VaultTestCase):
+    SALT = b"salty"
+
+    def test_derive_seal_empty_key_id_raises_value_error(self):
+        vault = self.open_vault()
+        with self.assertRaises(ValueError):
+            vault.derive_seal("", b"pw", self.SALT, 1, 1)
+
+    def test_password_or_salt_non_bytes_raises_type_error(self):
+        vault = self.open_vault()
+        for bad_password in ("text", 123, None, [b"x"], bytearray(b"x"), memoryview(b"x")):
+            with self.assertRaises(TypeError, msg=repr(bad_password)):
+                vault.derive_seal("k", bad_password, self.SALT, 1, 1)
+        for bad_salt in ("text", 123, None, ["s"], bytearray(b"s"), memoryview(b"s")):
+            with self.assertRaises(TypeError, msg=repr(bad_salt)):
+                vault.derive_seal("k", b"pw", bad_salt, 1, 1)
+
+    def test_empty_salt_raises_value_error(self):
+        vault = self.open_vault()
+        with self.assertRaises(ValueError):
+            vault.derive_seal("k", b"pw", b"", 1, 1)
+
+    def test_iterations_or_length_non_integer_raises_type_error(self):
+        vault = self.open_vault()
+        for bad in (True, False, 1.0, 2.5, "1", None):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.derive_seal("k", b"pw", self.SALT, bad, 1)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.derive_seal("k", b"pw", self.SALT, 1, bad)
+
+    def test_iterations_or_length_below_one_raises_value_error(self):
+        vault = self.open_vault()
+        for bad in (0, -1, -1000):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                vault.derive_seal("k", b"pw", self.SALT, bad, 1)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                vault.derive_seal("k", b"pw", self.SALT, 1, bad)
+
+    def test_rejected_derive_seal_writes_nothing(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        before = self.disk_manifest()
+        bad_calls = (
+            lambda: vault.derive_seal("", b"pw", self.SALT, 1, 1),
+            lambda: vault.derive_seal("k", "pw", self.SALT, 1, 1),
+            lambda: vault.derive_seal("k", b"pw", "salt", 1, 1),
+            lambda: vault.derive_seal("k", b"pw", b"", 1, 1),
+            lambda: vault.derive_seal("k", b"pw", self.SALT, True, 1),
+            lambda: vault.derive_seal("k", b"pw", self.SALT, 1, 0),
+        )
+        for call in bad_calls:
+            with self.assertRaises((TypeError, ValueError)):
+                call()
+        self.assertEqual(self.disk_manifest(), before)
+        self.assertEqual(vault.versions("k"), [1])
+        self.assertEqual(vault.load("k"), b"v1")
+
+    def test_derivation_query_empty_key_id_raises_value_error(self):
+        vault = self.open_vault()
+        with self.assertRaises(ValueError):
+            vault.derivation("")
+
+    def test_derivation_query_non_integer_version_raises_type_error(self):
+        vault = self.open_vault()
+        vault.derive_seal("k", b"pw", self.SALT, 1, 1)
+        # None is the documented "active version" sentinel, not an error.
+        self.assertIsNotNone(vault.derivation("k", None))
+        for bad in (1.0, True, False, "1", 2.5, (1,)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.derivation("k", bad)
+
+    def test_derivation_query_unknown_key_or_version_raises_key_error(self):
+        vault = self.open_vault()
+        vault.derive_seal("k", b"pw", self.SALT, 1, 8)
+        with self.assertRaises(KeyError):
+            vault.derivation("never-sealed")
+        for bad_version in (0, 2, 99):
+            with self.assertRaises(KeyError, msg=repr(bad_version)):
+                vault.derivation("k", bad_version)
+
+
+class TestDerivationReloadValidation(VaultTestCase):
+    SALT = b"salty-salt"
+
+    def _fresh_vault(self) -> tuple[Vault, Path]:
+        root = Path(self._tmp.name) / f"case-{next(self._counter)}"
+        return Vault(root), root
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._counter = iter(range(1000))
+
+    def _derive_one(self) -> tuple[Vault, int, Path]:
+        vault, root = self._fresh_vault()
+        version = vault.derive_seal("k", b"pw", self.SALT, 1000, 32)
+        return vault, version, root
+
+    def _tamper(self, root: Path, mutate) -> None:
+        path = root / MANIFEST_NAME
+        manifest = json.loads(path.read_bytes().decode("utf-8"))
+        record = manifest["keys"]["k"]["versions"][0]
+        mutate(record.setdefault("derivation", {}))
+        path.write_bytes(_dump_manifest(manifest))
+
+    def test_declared_length_smaller_than_material_is_rejected(self):
+        vault, version, root = self._derive_one()
+        self._tamper(root, lambda d: d.update(length=16))
+        with self.assertRaises(ValueError):
+            vault.reload()
+        self.assertEqual(vault.versions("k"), [version])
+        self.assertEqual(vault.derivation("k")["length"], 32)
+
+    def test_declared_length_larger_than_material_is_rejected(self):
+        vault, version, root = self._derive_one()
+        self._tamper(root, lambda d: d.update(length=48))
+        with self.assertRaises(ValueError):
+            vault.reload()
+        self.assertEqual(vault.versions("k"), [version])
+
+    def test_missing_or_empty_salt_is_rejected(self):
+        for mutate in (
+            lambda d: d.pop("salt"),
+            lambda d: d.update(salt=""),
+            lambda d: d.update(salt=123),
+            lambda d: d.update(salt="!!!not-base64!!!"),
+        ):
+            vault, _, root = self._derive_one()
+            self._tamper(root, mutate)
+            with self.assertRaises(ValueError):
+                vault.reload()
+            self.assertEqual(
+                vault.load("k"), _derive_material(b"pw", self.SALT, 1000, 32)
+            )
+
+    def test_illegal_parameters_are_rejected(self):
+        bad_values = (0, -1, 1.5, "1000", True, False, None)
+        for bad in bad_values:
+            vault, _, root = self._derive_one()
+            self._tamper(root, lambda d, b=bad: d.update(iterations=b))
+            with self.assertRaises(ValueError, msg=f"iterations={bad!r}"):
+                vault.reload()
+            self.assertEqual(vault.derivation("k")["iterations"], 1000)
+        for bad in bad_values:
+            vault, _, root = self._derive_one()
+            self._tamper(root, lambda d, b=bad: d.update(length=b))
+            with self.assertRaises(ValueError, msg=f"length={bad!r}"):
+                vault.reload()
+            self.assertEqual(vault.derivation("k")["length"], 32)
+
+    def test_non_object_derivation_is_rejected(self):
+        for bad in ("x", 123, ["salt"]):
+            vault, _, root = self._derive_one()
+            path = root / MANIFEST_NAME
+            manifest = json.loads(path.read_bytes().decode("utf-8"))
+            manifest["keys"]["k"]["versions"][0]["derivation"] = bad
+            path.write_bytes(_dump_manifest(manifest))
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                vault.reload()
+
+    def test_failed_reload_touches_no_disk_records(self):
+        vault, version, root = self._derive_one()
+        vault.seal("k", b"plain")
+        materials = sorted(
+            p.read_bytes() for p in (root / MATERIALS_DIR).rglob("*.bin")
+        )
+        self._tamper(root, lambda d: d.update(length=1))
+        # Snapshot the on-disk state as it stands at reload time: a failed
+        # reload must neither repair nor remove anything on disk.
+        manifest_path = root / MANIFEST_NAME
+        manifest_before = manifest_path.read_bytes()
+        with self.assertRaises(ValueError):
+            vault.reload()
+        self.assertEqual(manifest_path.read_bytes(), manifest_before)
+        self.assertEqual(
+            sorted(p.read_bytes() for p in (root / MATERIALS_DIR).rglob("*.bin")),
+            materials,
+        )
+        # Keys already in hand stay readable and the snapshot is untouched.
+        self.assertEqual(vault.versions("k"), [version, 2])
+        self.assertEqual(vault.active("k"), 2)
+        self.assertEqual(vault.derivation("k", 2), {})
+
+
+class TestClose(VaultTestCase):
+    def test_close_releases_lock_handle_and_is_idempotent(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        self.assertIsNotNone(vault._lock_fh)
+        vault.close()
+        self.assertIsNone(vault._lock_fh)
+        vault.close()  # repeated release is not an error
+        self.assertIsNone(vault._lock_fh)
+
+    def test_operation_after_close_reopens_lock_with_same_behaviour(self):
+        vault = self.open_vault()
+        vault.seal("k", b"one")
+        vault.close()
+        self.assertEqual(vault.seal("k", b"two"), 2)
+        self.assertIsNotNone(vault._lock_fh)
+        self.assertEqual(vault.load("k", 1), b"one")
+        self.assertEqual(vault.load("k"), b"two")
+        vault.close()
+        self.assertEqual(
+            vault.derive_seal("k2", b"pw", b"salt", 100, 16), 1
+        )
+        vault.reload()
+        self.assertEqual(vault.active("k"), 2)
+        vault.close()
+
+    def test_close_and_concurrent_handle_still_serialised(self):
+        first = self.open_vault()
+        second = self.open_vault()
+        first.close()
+        first.seal("k", b"from-first")
+        second.reload()
+        self.assertEqual(second.load("k"), b"from-first")
+
+
+class TestWindowsLockFallback(VaultTestCase):
+    """Force the ``msvcrt.locking`` branch used on Windows.
+
+    ``fcntl`` is patched away and a tiny in-process fake ``msvcrt`` stands
+    in for the C runtime byte-range locks, so the Windows fallback branch
+    (acquire, timed-out retry and release) is exercised on every platform.
+    """
+
+    def _fake_msvcrt(self) -> tuple[types.ModuleType, dict]:
+        module = types.ModuleType("msvcrt")
+        module.LK_LOCK = 1
+        module.LK_NBLCK = 2
+        module.LK_UNLCK = 3
+        state = {"held": {}, "guard": threading.Lock(), "contended": 0}
+
+        def fake_locking(fd, mode, nbytes):
+            st = os.fstat(fd)
+            key = (st.st_dev, st.st_ino)
+            with state["guard"]:
+                if mode == module.LK_UNLCK:
+                    state["held"].pop(key, None)
+                else:
+                    owner = state["held"].get(key)
+                    if owner is not None and owner != threading.get_ident():
+                        state["contended"] += 1
+                        raise OSError("locking delay")
+                    state["held"][key] = threading.get_ident()
+
+        module.locking = fake_locking
+        return module, state
+
+    def test_fallback_acquire_and_release_path(self):
+        import keyvault_ledger.vault as vault_mod
+
+        fake, state = self._fake_msvcrt()
+        with mock.patch.object(vault_mod, "fcntl", None):
+            with mock.patch.dict(sys.modules, {"msvcrt": fake}):
+                vault = Vault(self.root)
+                self.assertEqual(vault.seal("k", b"m"), 1)
+                vault.derive_seal("k", b"pw", b"salt", 10, 8)
+                vault.revoke("k", 1)
+                vault.reload()
+                self.assertEqual(state["held"], {})
+                vault.close()
+        self.assertEqual(Vault(self.root).load("k", 1), b"m")
+
+    def test_fallback_retries_until_lock_is_released(self):
+        import keyvault_ledger.vault as vault_mod
+
+        fake, state = self._fake_msvcrt()
+        with mock.patch.object(vault_mod, "fcntl", None):
+            with mock.patch.dict(sys.modules, {"msvcrt": fake}):
+                # Both handles exist before anyone holds the lock, so their
+                # construction never contends.
+                holder_vault = Vault(self.root)
+                waiter = Vault(self.root)
+                holder_vault.seal("k", b"seed")
+
+                holder_ready = threading.Event()
+                release_holder = threading.Event()
+                holder_error: list[BaseException] = []
+
+                def hold() -> None:
+                    try:
+                        # Only the inter-process file lock is simulated by
+                        # the fake msvcrt; the in-process RLock belongs to
+                        # the main thread and must stay out of the way.
+                        with holder_vault._file_lock():
+                            holder_ready.set()
+                            release_holder.wait(timeout=5)
+                    except BaseException as exc:  # captured below
+                        holder_error.append(exc)
+
+                holder = threading.Thread(target=hold)
+                holder.start()
+                self.assertTrue(holder_ready.wait(timeout=5))
+
+                seal_done = threading.Event()
+
+                def do_seal() -> None:
+                    # The Windows fallback must keep retrying (LK_LOCK raises
+                    # while the byte range is locked) rather than crashing or
+                    # proceeding unlocked.
+                    waiter.seal("k", b"waited")
+                    seal_done.set()
+
+                sealer = threading.Thread(target=do_seal)
+                sealer.start()
+                # Holder keeps the lock well past the first 0.05s retry, so
+                # the sealer is guaranteed blocked, having seen contention.
+                sealer.join(timeout=1.0)
+                self.assertTrue(sealer.is_alive())
+                self.assertGreaterEqual(state["contended"], 1)
+
+                release_holder.set()
+                self.assertTrue(seal_done.wait(timeout=5))
+                holder.join(timeout=5)
+
+        self.assertFalse(holder.is_alive())
+        self.assertEqual(holder_error, [])
+        self.assertEqual(waiter.load("k"), b"waited")
+        self.assertEqual(state["held"], {})
 
 
 class TestCli(VaultTestCase):

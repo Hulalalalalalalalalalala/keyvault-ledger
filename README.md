@@ -20,6 +20,13 @@ Python 3.11 or newer. Standard library only.
 
 `keyvault_ledger.Vault(root)` opens the vault directory `root`.
 - `seal(key_id, material) -> int` stores material and returns the new version.
+- `derive_seal(key_id, password, salt, iterations, length) -> int` derives the
+  material with PBKDF2-HMAC-SHA256 (standard library), seals it through the
+  ordinary append-only path, and returns the new version. The passphrase is
+  never persisted.
+- `derivation(key_id, version=None) -> dict` returns
+  `{"salt", "iterations", "length"}` for a derived version (the active one by
+  default) or an empty record `{}` for a version sealed directly.
 - `load(key_id, version=None) -> bytes` returns stored material.
 - `versions(key_id) -> list[int]` ascending.
 - `active(key_id) -> int` returns the current version.
@@ -29,6 +36,32 @@ Python 3.11 or newer. Standard library only.
   (empty for an unknown or never-revoked key).
 - `reload() -> None` re-reads and validates the whole keyring before replacing it.
 - `manifest() -> dict` returns the persisted manifest.
+- `close() -> None` releases the lock file handle; the next operation reopens
+  it and reacquires the same lock. Repeated calls are harmless.
+
+### Passphrase-derived sealing
+
+`derive_seal` derives the key material from a passphrase with
+PBKDF2-HMAC-SHA256 from the standard library and then runs it through exactly
+the same append-only seal path as `seal`: derived and direct seals share one
+file lock and one non-repeating version sequence, and historical material is
+never overwritten. The salt, iteration count and derived length are stored
+alongside that version (the salt as base64 text); the passphrase itself never
+touches disk. The bytes read back are byte-for-byte identical to re-running
+PBKDF2 with the same passphrase, salt and parameters. `derivation` queries
+those parameters, defaulting to the active version; a directly sealed version
+yields an empty record.
+
+`derive_seal` raises `ValueError` for an empty key id, an empty salt, or a
+non-positive iteration count/length, and `TypeError` when the passphrase or
+salt is not `bytes` or when an iteration count/length is not a genuine
+integer (bools and floats do not count). `derivation` follows the read
+semantics of the revocation queries: empty key id → `ValueError`, non-integer
+version → `TypeError`, unknown key or version → `KeyError`. On `reload`, every
+derivation record is re-checked: a length that disagrees with the stored
+material, a missing/corrupt salt, or an illegal parameter makes the reload
+fail with `ValueError` while the existing snapshot and disk records stay
+untouched.
 
 ### Revocation
 
@@ -54,15 +87,16 @@ The command line keeps its three entry points (`versions`, `seal`,
 ### Concurrency
 
 Multiple processes may share one vault directory. Opening, sealing,
-revoking and reloading all run under an exclusive, blocking file lock
-held on `vault.lock` inside the vault directory (standard-library
+deriving, revoking and reloading all run under an exclusive, blocking file
+lock held on `vault.lock` inside the vault directory (standard-library
 `fcntl.flock`, or `msvcrt.locking` on Windows). A writer waits until it
 holds the lock and completes its whole record before releasing it, so
-interleaved seals and revokes from different processes never duplicate or
-skip a version number and never overwrite historical material. A reload
-concurrent with a seal reads either the complete old records or the
+interleaved seals, derives and revokes from different processes never
+duplicate or skip a version number and never overwrite historical material.
+A reload concurrent with a seal reads either the complete old records or the
 complete newly persisted ones. The lock file is only a mutual-exclusion
-device: it carries no key data and plays no part in validation.
+device: it carries no key data and plays no part in validation. `close()`
+releases its handle; later operations reopen and relock transparently.
 
 ## Tests
 
@@ -70,5 +104,5 @@ device: it carries no key data and plays no part in validation.
 
 ## Limits
 
-No key derivation: callers supply the material.
-No network service.
+Key material must be supplied as bytes, or derived from a passphrase with
+`derive_seal`; there is no other derivation. No network service.
