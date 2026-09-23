@@ -1,9 +1,14 @@
 """Append-only local key vault.
 
 The vault persists an append-only version manifest (``manifest.json``) plus
-one material file per sealed version under ``materials/``.  Revocations live
-in their own append-only journal (``revocations.jsonl``): revoking a version
-only appends a record, never deleting or altering historical material.
+one material file per sealed version under ``materials/``.  A version's
+material is either supplied directly (``seal``) or derived from a password
+with PBKDF2-HMAC-SHA256 (``derive_seal``); derived versions record their
+salt, iteration count and derived length alongside the version in the
+manifest so the derivation can be repeated and checked byte for byte.  The
+password itself is never written to disk.  Revocations live in their own
+append-only journal (``revocations.jsonl``): revoking a version only
+appends a record, never deleting or altering historical material.
 ``reload()`` re-reads and validates the whole keyring, journal included, and
 swaps the in-memory snapshot atomically; readers only ever see a complete
 old or complete new snapshot.
@@ -95,6 +100,26 @@ def _check_version(version: int) -> None:
         raise TypeError("version must be an int")
 
 
+def _check_bytes(name: str, value: object) -> None:
+    """Reject anything that is not a genuine byte string (``bytes``).
+
+    ``bytearray``/``memoryview`` are rejected too: a password or a salt is
+    an immutable byte string, and accepting a mutable buffer that the
+    caller can change mid-derivation would make the sealed version depend
+    on state the vault does not control.
+    """
+    if type(value) is not bytes:
+        raise TypeError(f"{name} must be bytes")
+
+
+def _check_positive_int(name: str, value: object) -> None:
+    """Validate a positive integer parameter (bools/floats rejected)."""
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an int")
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1")
+
+
 class Vault:
     """Local key vault rooted at a directory on disk."""
 
@@ -105,8 +130,10 @@ class Vault:
         self._root.mkdir(parents=True, exist_ok=True)
         (self._root / MATERIALS_DIR).mkdir(exist_ok=True)
         # The lock file coordinates every process using this directory; it
-        # is created up front so initialisation itself is serialised.
-        self._lock_fh = open(self._root / LOCK_NAME, "a+b")
+        # is created up front so initialisation itself is serialised.  The
+        # handle is opened lazily so ``close()`` can release it and a later
+        # call transparently reopens it.
+        self._lock_fh = None
         try:
             with self._file_lock():
                 manifest_path = self._root / MANIFEST_NAME
@@ -125,7 +152,9 @@ class Vault:
                     _atomic_write(journal_path, b"")
                 self._snapshot, self._manifest = self._load_validated()
         except BaseException:
-            self._lock_fh.close()
+            if self._lock_fh is not None:
+                self._lock_fh.close()
+                self._lock_fh = None
             raise
 
     # ------------------------------------------------------------------
@@ -138,61 +167,74 @@ class Vault:
         if not isinstance(material, (bytes, bytearray, memoryview)):
             raise TypeError("material must be a bytes-like object")
         material = bytes(material)
+        return self._append_version(key_id, material, None)
 
-        with self._locked():
-            # Re-read and validate the persisted keyring under the
-            # inter-process lock: another process may have sealed since
-            # this handle last looked, and the next version number must be
-            # allocated from the latest state on disk so concurrent seals
-            # never duplicate or skip a version and never overwrite
-            # historical material.
-            snapshot, disk_manifest = self._load_validated()
-            new_manifest = copy.deepcopy(disk_manifest)
-            entry = new_manifest["keys"].setdefault(
-                key_id, {"active": 0, "versions": []}
-            )
-            records = entry["versions"]
-            new_version = records[-1]["version"] + 1 if records else 1
+    def derive_seal(
+        self,
+        key_id: str,
+        password: bytes,
+        salt: bytes,
+        iterations: int,
+        length: int,
+    ) -> int:
+        """Derive material from ``password`` and seal it as a new version.
 
-            rel_file = (
-                f"{MATERIALS_DIR}/{_encode_key_id(key_id)}/{new_version}.bin"
-            )
-            digest = hashlib.sha256(material).hexdigest()
+        The material is derived with PBKDF2-HMAC-SHA256 from the standard
+        library (``hashlib.pbkdf2_hmac``) and then stored through the same
+        append path as :meth:`seal`.  The salt, iteration count and derived
+        length are persisted with the new version (see
+        :meth:`derivation`); the password itself is never written to disk.
+        Returns the allocated version number.
+        """
+        _check_key_id(key_id)
+        _check_bytes("password", password)
+        _check_bytes("salt", salt)
+        if salt == b"":
+            raise ValueError("salt must not be empty")
+        _check_positive_int("iterations", iterations)
+        _check_positive_int("length", length)
 
-            # Write the material first, then flip the manifest.  The manifest
-            # is the source of truth and is replaced atomically, so a crash
-            # in between can never expose a half-recorded version; if the
-            # manifest write itself fails, remove the material just written
-            # so a failed seal leaves no orphan behind.
-            material_path = self._root / rel_file
-            material_path.parent.mkdir(parents=True, exist_ok=True)
-            _atomic_write(material_path, material)
+        material = hashlib.pbkdf2_hmac(
+            "sha256", password, salt, iterations, dklen=length
+        )
+        parameters = {
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "iterations": iterations,
+            "length": length,
+        }
+        return self._append_version(key_id, material, parameters)
 
-            try:
-                records.append(
-                    {"version": new_version, "sha256": digest, "file": rel_file}
-                )
-                entry["active"] = new_version
-                _atomic_write(self._root / MANIFEST_NAME, _dump_manifest(new_manifest))
-            except BaseException:
-                # ``new_manifest`` is a private deep copy and is simply
-                # discarded; only the material written above needs cleanup.
-                try:
-                    material_path.unlink()
-                except OSError:
-                    pass
-                raise
+    def derivation(
+        self, key_id: str, version: int | None = None
+    ) -> dict[str, object]:
+        """Return a version's password-derivation parameters.
 
-            # ``snapshot`` was just built by ``_load_validated`` and is not
-            # shared yet, so it can be extended in place before publishing.
-            slot = snapshot.setdefault(
-                key_id, {"active": 0, "versions": {}, "revoked": set()}
-            )
-            slot["versions"][new_version] = material
-            slot["active"] = new_version
-            self._snapshot = snapshot
-            self._manifest = new_manifest
-            return new_version
+        Returns ``{"salt": bytes, "iterations": int, "length": int}`` for a
+        version sealed via :meth:`derive_seal`.  A directly sealed version
+        has no derivation record and yields an empty dict without raising.
+        With ``version`` omitted the active version is queried.  Raises
+        ``KeyError`` for an unknown key or a version that does not exist,
+        ``TypeError`` for a non-integer version and ``ValueError`` for an
+        empty key id — the same conventions as the revocation queries.
+        """
+        _check_key_id(key_id)
+        if version is not None:
+            _check_version(version)
+        entry = self._snapshot.get(key_id)
+        if entry is None:
+            raise KeyError(key_id)
+        wanted = entry["active"] if version is None else version
+        record = entry["derivations"].get(wanted)
+        if record is None:
+            if wanted not in entry["versions"]:
+                raise KeyError(f"{key_id!r} version {wanted!r}")
+            # Directly sealed version: no derivation parameters.
+            return {}
+        return {
+            "salt": bytes(record["salt"]),
+            "iterations": record["iterations"],
+            "length": record["length"],
+        }
 
     def load(self, key_id: str, version: int | None = None) -> bytes:
         """Return the stored material for ``key_id`` (active version by default)."""
@@ -310,6 +352,18 @@ class Vault:
         """Return a deep copy of the persisted manifest."""
         return copy.deepcopy(self._manifest)
 
+    def close(self) -> None:
+        """Release the lock file handle.
+
+        Idempotent: closing an already closed vault does nothing.  A later
+        call reopens the lock file and reacquires the lock, so observable
+        behaviour is unchanged.
+        """
+        with self._lock:
+            if self._lock_fh is not None:
+                self._lock_fh.close()
+                self._lock_fh = None
+
     # ------------------------------------------------------------------
     # internals
     # ------------------------------------------------------------------
@@ -322,8 +376,12 @@ class Vault:
         held for the whole disk operation and released only once the record
         is fully done.  Uses ``fcntl.flock`` where available and falls back
         to ``msvcrt.locking`` on Windows — standard library only, no
-        network coordination.
+        network coordination.  The handle is opened on demand so a vault
+        that was released with :meth:`close` transparently reopens its lock
+        file on the next operation.
         """
+        if self._lock_fh is None:
+            self._lock_fh = open(self._root / LOCK_NAME, "a+b")
         if fcntl is not None:
             fcntl.flock(self._lock_fh.fileno(), fcntl.LOCK_EX)
             try:
@@ -357,6 +415,85 @@ class Vault:
             with self._file_lock():
                 yield
 
+    def _append_version(
+        self, key_id: str, material: bytes, parameters: dict | None
+    ) -> int:
+        """Append one version's material and manifest record.
+
+        Shared by :meth:`seal` (``parameters is None``) and
+        :meth:`derive_seal` (``parameters`` carries the base64 salt plus
+        iteration count and derived length).  Entry-point validation is the
+        caller's responsibility; by the time this runs ``material`` is
+        ``bytes`` and ``parameters`` is either ``None`` or a manifest-ready
+        dict.
+        """
+        with self._locked():
+            # Re-read and validate the persisted keyring under the
+            # inter-process lock: another process may have sealed since
+            # this handle last looked, and the next version number must be
+            # allocated from the latest state on disk so concurrent seals
+            # never duplicate or skip a version and never overwrite
+            # historical material.
+            snapshot, disk_manifest = self._load_validated()
+            new_manifest = copy.deepcopy(disk_manifest)
+            entry = new_manifest["keys"].setdefault(
+                key_id, {"active": 0, "versions": []}
+            )
+            records = entry["versions"]
+            new_version = records[-1]["version"] + 1 if records else 1
+
+            rel_file = (
+                f"{MATERIALS_DIR}/{_encode_key_id(key_id)}/{new_version}.bin"
+            )
+            digest = hashlib.sha256(material).hexdigest()
+
+            # Write the material first, then flip the manifest.  The manifest
+            # is the source of truth and is replaced atomically, so a crash
+            # in between can never expose a half-recorded version; if the
+            # manifest write itself fails, remove the material just written
+            # so a failed seal leaves no orphan behind.
+            material_path = self._root / rel_file
+            material_path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(material_path, material)
+
+            try:
+                record = {
+                    "version": new_version,
+                    "sha256": digest,
+                    "file": rel_file,
+                }
+                if parameters is not None:
+                    record["derivation"] = parameters
+                records.append(record)
+                entry["active"] = new_version
+                _atomic_write(self._root / MANIFEST_NAME, _dump_manifest(new_manifest))
+            except BaseException:
+                # ``new_manifest`` is a private deep copy and is simply
+                # discarded; only the material written above needs cleanup.
+                try:
+                    material_path.unlink()
+                except OSError:
+                    pass
+                raise
+
+            # ``snapshot`` was just built by ``_load_validated`` and is not
+            # shared yet, so it can be extended in place before publishing.
+            slot = snapshot.setdefault(
+                key_id,
+                {"active": 0, "versions": {}, "revoked": set(), "derivations": {}},
+            )
+            slot["versions"][new_version] = material
+            if parameters is not None:
+                slot["derivations"][new_version] = {
+                    "salt": base64.b64decode(parameters["salt"]),
+                    "iterations": parameters["iterations"],
+                    "length": parameters["length"],
+                }
+            slot["active"] = new_version
+            self._snapshot = snapshot
+            self._manifest = new_manifest
+            return new_version
+
     def _is_fresh_dir(self) -> bool:
         for child in self._root.iterdir():
             if child.name == LOCK_NAME:
@@ -378,8 +515,9 @@ class Vault:
         Returns ``(snapshot, manifest)``.  The snapshot carries each key's
         materials plus its revoked-version set.  Raises ``ValueError`` if
         the manifest or the revocation journal is corrupt or malformed, a
-        stored material is missing or mismatches its record, or the
-        journal revokes an unknown/duplicate version.
+        stored material is missing or mismatches its record, a derivation
+        record is malformed or does not match its material, or the journal
+        revokes an unknown/duplicate version.
         """
         manifest_path = self._root / MANIFEST_NAME
         try:
@@ -419,6 +557,7 @@ class Vault:
                 )
 
             versions: dict[int, bytes] = {}
+            derivations: dict[int, dict] = {}
             previous = 0
             for record in records:
                 if not isinstance(record, dict):
@@ -464,6 +603,59 @@ class Vault:
                     raise ValueError(
                         f"material mismatch for key {key_id!r} version {version}"
                     )
+                derivation = record.get("derivation")
+                if derivation is not None:
+                    # Derived version: the salt, iteration count and derived
+                    # length must be present, well-formed and consistent
+                    # with the material on disk.  The password is never
+                    # stored, so the derivation itself cannot be replayed
+                    # here; only the parameters are checked.
+                    if not isinstance(derivation, dict):
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} has bad derivation"
+                        )
+                    salt_text = derivation.get("salt")
+                    iterations = derivation.get("iterations")
+                    length = derivation.get("length")
+                    if not isinstance(salt_text, str) or salt_text == "":
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} derivation has bad salt"
+                        )
+                    try:
+                        salt = base64.b64decode(salt_text, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} derivation has bad salt"
+                        ) from exc
+                    if salt == b"":
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} derivation has empty salt"
+                        )
+                    if type(iterations) is not int or iterations < 1:
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} derivation has bad iterations"
+                        )
+                    if type(length) is not int or length < 1:
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} derivation has bad length"
+                        )
+                    if length != len(material):
+                        raise ValueError(
+                            f"manifest format invalid: key {key_id!r} version "
+                            f"{version} derivation length does not match "
+                            "material"
+                        )
+                    derivations[version] = {
+                        "salt": salt,
+                        "iterations": iterations,
+                        "length": length,
+                    }
                 versions[version] = material
 
             if active != previous:
@@ -475,6 +667,7 @@ class Vault:
                 "active": active,
                 "versions": versions,
                 "revoked": set(),
+                "derivations": derivations,
             }
 
         self._load_revocations(snapshot)
