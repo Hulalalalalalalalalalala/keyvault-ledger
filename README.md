@@ -32,6 +32,8 @@ Python 3.11 or newer. Standard library only.
 - `load(key_id, version=None) -> bytes` returns stored material.
 - `versions(key_id) -> list[int]` ascending.
 - `active(key_id) -> int` returns the current version.
+- `set_active(key_id, version) -> None` points the active version back at a
+  sealed historical version.
 - `revoke(key_id, version) -> None` marks a sealed version revoked.
 - `is_revoked(key_id, version) -> bool` reports a version's revocation status.
 - `revoked_versions(key_id) -> list[int]` lists revoked versions, ascending
@@ -84,21 +86,56 @@ returns `[]` for an unknown key and raises `ValueError` only for an empty
 key id.
 
 The command line keeps its three entry points (`versions`, `seal`,
-`reload`); revocation and its queries are library-only.
+`reload`); revocation, its queries and active-version redirection are
+library-only.
+
+### Active-version redirection
+
+`set_active` points the active version of a key back at a sealed historical
+version: afterwards `active`, a version-less `load` and a version-less
+`derivation` all resolve to the version named by the last redirection,
+while reading an explicitly numbered version is unchanged. The redirection
+only appends one record to the append-only journal `activations.jsonl`; the
+manifest, every material and every revocation marker stay untouched. The
+file is absent from a vault whose active version was never redirected and
+is created on the first redirection; the marker survives a full `reload()`
+and reopening the vault, which validate the manifest, every material and
+both journals together before swapping the in-memory snapshot.
+
+The manifest's active pointer always tracks the most recently sealed
+version, so sealing new material after a redirection moves the active
+version to that new version; earlier redirection records remain on disk
+but no longer apply. Repeatedly redirecting one key appends one record per
+call, with the last one winning, and a key that was never redirected keeps
+the most recently sealed version as its active version. Revoking the active
+version never moves the pointer (the existing revocation semantics are
+unchanged), and a version that later gets revoked after it was pointed at
+is not an error.
+
+`set_active` raises `ValueError` for an empty key id, for pointing at the
+version that is already active, or for pointing at a revoked version,
+`TypeError` for a non-integer version (floats, bools, …), and `KeyError`
+for a key that was never sealed or a version that does not exist. A failed
+call appends no record. On `reload`, a malformed journal or a record that
+names an unknown key or a version that never existed makes the reload fail
+with `ValueError` while the existing snapshot and disk records stay
+untouched.
 
 ### Concurrency
 
 Multiple processes may share one vault directory. Opening, sealing,
-deriving, revoking and reloading all run under an exclusive, blocking file
-lock held on `vault.lock` inside the vault directory (standard-library
-`fcntl.flock`, or `msvcrt.locking` on Windows). A writer waits until it
-holds the lock and completes its whole record before releasing it, so
-interleaved seals, derives and revokes from different processes never
-duplicate or skip a version number and never overwrite historical material.
-A reload concurrent with a seal reads either the complete old records or the
-complete newly persisted ones. The lock file is only a mutual-exclusion
-device: it carries no key data and plays no part in validation. `close()`
-releases its handle; later operations reopen and relock transparently.
+deriving, revoking, redirecting and reloading all run under an exclusive,
+blocking file lock held on `vault.lock` inside the vault directory
+(standard-library `fcntl.flock`, or `msvcrt.locking` on Windows). A writer
+waits until it holds the lock and completes its whole record before
+releasing it, so interleaved seals, derives, revokes and redirections from
+different processes never duplicate or skip a version number, never
+overwrite historical material, and never append a redirection against a
+sealed tip that another process has since moved. A reload concurrent with a
+writer reads either the complete old records or the complete newly
+persisted ones. The lock file is only a mutual-exclusion device: it carries
+no key data and plays no part in validation. `close()` releases its handle;
+later operations reopen and relock transparently.
 
 ## Tests
 
@@ -106,7 +143,10 @@ releases its handle; later operations reopen and relock transparently.
 
 ## Limits
 
-Key material must be supplied as a bytes-like object (`bytes`, `bytearray`
-or `memoryview`); supplying any other type raises `TypeError`. Otherwise it
-is derived from a passphrase with `derive_seal`; there is no other
-derivation. No network service.
+`seal` accepts key material as any bytes-like object (`bytes`, `bytearray`
+or `memoryview`); supplying any other type raises `TypeError`. The
+derivation entry points are narrower: `derive_seal` takes the passphrase
+and salt as genuine `bytes` only — `bytearray` and `memoryview` are
+rejected with `TypeError` there even though `seal` accepts them. There is
+no derivation path apart from `derive_seal` (PBKDF2-HMAC-SHA256); nothing
+is derived implicitly. No network service.

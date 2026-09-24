@@ -4,9 +4,18 @@ The vault persists an append-only version manifest (``manifest.json``) plus
 one material file per sealed version under ``materials/``.  Revocations live
 in their own append-only journal (``revocations.jsonl``): revoking a version
 only appends a record, never deleting or altering historical material.
-``reload()`` re-reads and validates the whole keyring, journal included, and
-swaps the in-memory snapshot atomically; readers only ever see a complete
-old or complete new snapshot.
+Redirections of the active version live in a second optional, append-only
+journal (``activations.jsonl``): ``set_active`` only appends a record that
+points the active version back at a sealed historical version, never
+touching the manifest.  The file is absent from a vault whose active
+version was never redirected and is created on the first redirection.  The
+manifest's active pointer always tracks the latest sealed version, so
+sealing new material moves the active pointer to the new version and leaves
+earlier redirections behind; a redirection record carries the sealed tip
+it was written against and only applies while that tip is still current.
+``reload()`` re-reads and validates the whole keyring, both journals
+included, and swaps the in-memory snapshot atomically; readers only ever
+see a complete old or complete new snapshot.
 
 Besides direct sealing (``seal``), a version's material may be derived from
 a passphrase with PBKDF2-HMAC-SHA256 (``derive_seal``).  The passphrase
@@ -17,13 +26,13 @@ and re-checked on reload.
 
 Multiple processes may share one vault directory.  Every operation that
 reads from or writes to the disk state (open, seal, derive_seal, revoke,
-reload) runs under an exclusive, blocking file lock held on ``vault.lock``
-inside the vault directory (``fcntl.flock`` where available,
+set_active, reload) runs under an exclusive, blocking file lock held on
+``vault.lock`` inside the vault directory (``fcntl.flock`` where available,
 ``msvcrt.locking`` on Windows — standard library only).  A writer waits
 until it holds the lock and completes its whole record before releasing it,
-so interleaved seals and revokes from different processes never duplicate
-or skip a version number and never overwrite or truncate historical
-material.  The lock file is only a mutual-exclusion device: it carries no
+so interleaved seals, revokes and redirections from different processes
+never duplicate or skip a version number, never overwrite or truncate
+historical material, and never append a redirection against a stale tip.  The lock file is only a mutual-exclusion device: it carries no
 key data and plays no part in manifest or material validation.  ``close()``
 releases the lock file handle; the next operation reopens it and reacquires
 the same lock, with no observable change in behaviour.
@@ -49,6 +58,7 @@ except ImportError:  # Windows: fall back to msvcrt in _file_lock.
 MANIFEST_NAME = "manifest.json"
 MATERIALS_DIR = "materials"
 REVOCATIONS_NAME = "revocations.jsonl"
+ACTIVATIONS_NAME = "activations.jsonl"
 LOCK_NAME = "vault.lock"
 FORMAT_VERSION = 1
 
@@ -169,6 +179,10 @@ class Vault:
                     # an empty journal; the journal is append-only and never
                     # rewritten.
                     _atomic_write(journal_path, b"")
+                # The activations journal is optional: a vault whose active
+                # version was never redirected simply has no such file, and
+                # it is only created by the first ``set_active``.  Its
+                # absence is an ordinary state, both here and on reload.
                 self._snapshot, self._manifest = self._load_validated()
         except BaseException:
             self._release_lock_file()
@@ -265,11 +279,72 @@ class Vault:
         return sorted(entry["versions"])
 
     def active(self, key_id: str) -> int:
-        """Return the active (most recently sealed) version of ``key_id``."""
+        """Return the active version of ``key_id``.
+
+        Normally the most recently sealed version; :meth:`set_active` can
+        redirect the pointer back at a historical version.
+        """
         entry = self._snapshot.get(key_id)
         if entry is None:
             raise KeyError(key_id)
         return entry["active"]
+
+    def set_active(self, key_id: str, version: int) -> None:
+        """Point the active version of ``key_id`` back at ``version``.
+
+        Only a pointer is redirected: a record is appended to the
+        append-only ``activations.jsonl`` journal and no material, manifest
+        entry or revocation marker changes.  Repeated redirections of one
+        key append one record each, with the last one winning.  A later
+        seal moves the active version to the newly sealed version again,
+        independent of any earlier redirection.  Pointing at the current
+        active version or at a revoked version is rejected; a version that
+        was active and is revoked afterwards is not an error.
+        """
+        _check_key_id(key_id)
+        _check_version(version)
+
+        with self._locked():
+            # Re-read and validate the persisted keyring under the
+            # inter-process lock so the checks, the sealed tip recorded with
+            # the redirection and the appended line all reflect the latest
+            # state on disk, including seals and redirections appended by
+            # other processes.
+            snapshot, disk_manifest = self._load_validated()
+            entry = snapshot.get(key_id)
+            if entry is None:
+                raise KeyError(key_id)
+            if version not in entry["versions"]:
+                raise KeyError(f"{key_id!r} version {version!r}")
+            if version == entry["active"]:
+                raise ValueError(
+                    f"{key_id!r} version {version!r} is already active"
+                )
+            if version in entry["revoked"]:
+                raise ValueError(
+                    f"{key_id!r} version {version!r} is revoked"
+                )
+
+            # The manifest's pointer stays at the sealed tip; recording the
+            # tip this redirection was written against lets a later reload
+            # tell redirections a newer seal has since superseded apart from
+            # the ones still in force.
+            tip = max(entry["versions"])
+            record = {"key_id": key_id, "version": version, "tip": tip}
+            line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            activations_path = self._root / ACTIVATIONS_NAME
+            # Append-only: the file is absent until the first redirection
+            # and is created here; a single write in append mode only adds a
+            # record, never rewriting history.  A failed write leaves no
+            # partial record and the snapshot is not published.
+            with open(activations_path, "ab") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            entry["active"] = version
+            self._snapshot = snapshot
+            self._manifest = disk_manifest
 
     def revoke(self, key_id: str, version: int) -> None:
         """Mark ``version`` of ``key_id`` as revoked.
@@ -344,12 +419,12 @@ class Vault:
         """Re-read and validate the whole keyring, then swap the snapshot.
 
         Never writes to disk.  The whole read-and-validate pass happens
-        under both locks so it cannot interleave with a seal or revoke —
-        in this process or any other: the reload reads either the complete
-        old records or the complete newly persisted ones, and swapping in a
-        snapshot read before a concurrent seal completed would resurrect an
-        old snapshot and could later reuse its version numbers.  On any
-        validation failure the current in-memory snapshot is kept
+        under both locks so it cannot interleave with a seal, revoke or
+        redirection — in this process or any other: the reload reads either
+        the complete old records or the complete newly persisted ones, and
+        swapping in a snapshot read before a concurrent seal completed would
+        resurrect an old snapshot and could later reuse its version numbers.
+        On any validation failure the current in-memory snapshot is kept
         untouched.
         """
         with self._locked():
@@ -528,10 +603,12 @@ class Vault:
         """Read and validate the whole keyring from disk.
 
         Returns ``(snapshot, manifest)``.  The snapshot carries each key's
-        materials plus its revoked-version set.  Raises ``ValueError`` if
-        the manifest or the revocation journal is corrupt or malformed, a
-        stored material is missing or mismatches its record, or the
-        journal revokes an unknown/duplicate version.
+        materials plus its revoked-version set and the active version in
+        force after applying the activations journal.  Raises ``ValueError``
+        if the manifest or either journal is corrupt or malformed, a stored
+        material is missing or mismatches its record, the revocation
+        journal revokes an unknown/duplicate version, or the activations
+        journal redirects an unknown key or a version that does not exist.
         """
         manifest_path = self._root / MANIFEST_NAME
         try:
@@ -655,6 +732,7 @@ class Vault:
             }
 
         self._load_revocations(snapshot)
+        self._load_activations(snapshot)
         return snapshot, manifest
 
     @staticmethod
@@ -755,3 +833,83 @@ class Vault:
                 )
             seen.add(marker)
             entry["revoked"].add(version)
+
+    def _load_activations(self, snapshot: dict[str, dict]) -> None:
+        """Validate the optional activations journal against ``snapshot``.
+
+        Redirects each key's active pointer in place: only the last record
+        per key whose recorded sealed tip is still the current tip applies,
+        so a seal made after a redirection resets the active version to the
+        new tip and any older redirection is spent.  The journal is absent
+        from a vault whose active version was never redirected; that is an
+        ordinary state and changes nothing.  Raises ``ValueError`` if the
+        file is unreadable, holds a malformed record, or redirects an
+        unknown key or a version that never existed.
+        """
+        path = self._root / ACTIVATIONS_NAME
+        if not path.exists():
+            return
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"activations journal unreadable: {exc}") from exc
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"activations journal corrupt: {exc}") from exc
+
+        # One entry per key: the last well-formed record wins; records a
+        # later seal has superseded simply never become the current pointer.
+        current: dict[str, tuple[int, int]] = {}
+        for line in text.splitlines():
+            if not line:
+                raise ValueError("activations journal corrupt: empty record")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"activations journal corrupt: {exc}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    "activations journal corrupt: record not an object"
+                )
+            key_id = record.get("key_id")
+            version = record.get("version")
+            tip = record.get("tip")
+            if not isinstance(key_id, str) or key_id == "":
+                raise ValueError(
+                    "activations journal corrupt: record has bad key_id"
+                )
+            if type(version) is not int:
+                raise ValueError(
+                    f"activations journal corrupt: key {key_id!r} record has "
+                    "bad version"
+                )
+            if type(tip) is not int:
+                raise ValueError(
+                    f"activations journal corrupt: key {key_id!r} record has "
+                    "bad tip"
+                )
+            entry = snapshot.get(key_id)
+            if entry is None or tip not in entry["versions"]:
+                raise ValueError(
+                    f"activations journal corrupt: key {key_id!r} record was "
+                    "written against a version that never existed"
+                )
+            if version not in entry["versions"]:
+                raise ValueError(
+                    f"activations journal corrupt: key {key_id!r} version "
+                    f"{version} was never sealed"
+                )
+            current[key_id] = (tip, version)
+
+        for key_id, (tip, version) in current.items():
+            entry = snapshot[key_id]
+            # Only the last redirection written while this tip was sealed
+            # applies; a newer seal moves the manifest tip past it and the
+            # active version stays at that newer version.  A target revoked
+            # after the redirection is not an error (revocation never moves
+            # the active pointer, and revoked material stays readable), so
+            # the pointer is left exactly where the record put it.
+            if tip == max(entry["versions"]):
+                entry["active"] = version

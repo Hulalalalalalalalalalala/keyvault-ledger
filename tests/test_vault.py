@@ -20,6 +20,7 @@ from pathlib import Path
 
 from keyvault_ledger import Vault
 from keyvault_ledger.vault import (
+    ACTIVATIONS_NAME,
     LOCK_NAME,
     MANIFEST_NAME,
     MATERIALS_DIR,
@@ -51,6 +52,33 @@ def _revoke_worker(root: str, key_id: str, versions: list[int]) -> None:
         vault.reload()
 
 
+def _set_active_worker(
+    root: str, key_id: str, choices: list[int], count: int
+) -> None:
+    vault = Vault(root)
+    for i in range(count):
+        try:
+            vault.set_active(key_id, choices[i % len(choices)])
+        except ValueError:
+            # Another process may have parked the pointer on this same
+            # version first; pointing at the current active version is a
+            # documented rejection, not a corruption signal.
+            pass
+        vault.reload()
+
+
+def _seal_and_set_active_worker(root: str, key_id: str, count: int) -> None:
+    vault = Vault(root)
+    for i in range(count):
+        version = vault.seal(key_id, f"m-{i}".encode("utf-8"))
+        if version > 1:
+            try:
+                vault.set_active(key_id, version - 1)
+            except ValueError:
+                pass
+        vault.reload()
+
+
 class VaultTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -73,6 +101,15 @@ class VaultTestCase(unittest.TestCase):
         return [
             json.loads(line)
             for line in self.journal_path().read_text("utf-8").splitlines()
+        ]
+
+    def activations_path(self) -> Path:
+        return self.root / ACTIVATIONS_NAME
+
+    def activation_records(self) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in self.activations_path().read_text("utf-8").splitlines()
         ]
 
 
@@ -569,6 +606,475 @@ class TestJournalValidation(VaultTestCase):
             vault.reload()
         self.assertEqual(vault.revoked_versions("k"), [1])
         self.assertTrue(vault.is_revoked("k", 1))
+
+
+class TestSetActive(VaultTestCase):
+    def test_redirect_moves_active_and_default_reads(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.seal("k", b"v3")
+        vault.set_active("k", 1)
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(vault.load("k"), b"v1")
+        self.assertEqual(vault.derivation("k", 1), {})
+
+    def test_explicit_version_reads_stay_independent_of_pointer(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.set_active("k", 1)
+        self.assertEqual(vault.load("k", 1), b"v1")
+        self.assertEqual(vault.load("k", 2), b"v2")
+        self.assertEqual(vault.versions("k"), [1, 2])
+
+    def test_version_less_derivation_follows_redirected_active(self):
+        vault = self.open_vault()
+        vault.derive_seal("k", b"pw", b"salt", 100, 16)
+        vault.seal("k", b"plain")
+        vault.set_active("k", 1)
+        record = vault.derivation("k")
+        self.assertEqual(record["iterations"], 100)
+        self.assertEqual(vault.derivation("k", 2), {})
+        expected = hashlib.pbkdf2_hmac(
+            "sha256", b"pw", record["salt"], 100, dklen=16
+        )
+        self.assertEqual(vault.load("k"), expected)
+
+    def test_repeated_redirections_append_and_last_one_wins(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.seal("k", b"v3")
+        vault.set_active("k", 1)
+        vault.set_active("k", 2)
+        self.assertEqual(vault.active("k"), 2)
+        vault.set_active("k", 1)
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(
+            self.activation_records(),
+            [
+                {"key_id": "k", "version": 1, "tip": 3},
+                {"key_id": "k", "version": 2, "tip": 3},
+                {"key_id": "k", "version": 1, "tip": 3},
+            ],
+        )
+
+    def test_redirection_touches_append_only_journal_only(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        manifest_before = self.manifest_path().read_bytes()
+        journal_before = self.journal_path().read_bytes()
+        materials = {
+            p: p.read_bytes()
+            for p in (self.root / MATERIALS_DIR).rglob("*.bin")
+        }
+        vault.set_active("k", 1)
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+        self.assertEqual(self.journal_path().read_bytes(), journal_before)
+        for path, data in materials.items():
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_activations_file_absent_until_first_redirection(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.reload()
+        self.assertFalse(self.activations_path().exists())
+        vault.seal("k", b"v2")
+        vault.set_active("k", 1)
+        self.assertTrue(self.activations_path().exists())
+        self.assertEqual(
+            self.activation_records(),
+            [{"key_id": "k", "version": 1, "tip": 2}],
+        )
+
+    def test_redirection_survives_reload_and_reopen(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.set_active("k", 1)
+
+        vault.reload()
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(vault.load("k"), b"v1")
+        self.assertEqual(vault.load("k", 2), b"v2")
+
+        reopened = self.open_vault()
+        self.assertEqual(reopened.active("k"), 1)
+        self.assertEqual(reopened.load("k"), b"v1")
+        reopened.reload()
+        self.assertEqual(reopened.active("k"), 1)
+
+    def test_sealing_after_redirection_resets_pointer_to_new_version(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.set_active("k", 1)
+        self.assertEqual(vault.seal("k", b"v3"), 3)
+        self.assertEqual(vault.active("k"), 3)
+        self.assertEqual(vault.load("k"), b"v3")
+        # The older redirection stays on disk but no longer applies.
+        vault.reload()
+        self.assertEqual(vault.active("k"), 3)
+        self.assertEqual(self.open_vault().active("k"), 3)
+        # Redirecting again works against the new tip.
+        vault.set_active("k", 2)
+        self.assertEqual(vault.active("k"), 2)
+        self.assertEqual(
+            self.activation_records()[-1],
+            {"key_id": "k", "version": 2, "tip": 3},
+        )
+
+    def test_keys_are_independent(self):
+        vault = self.open_vault()
+        vault.seal("a", b"a1")
+        vault.seal("a", b"a2")
+        vault.seal("b", b"b1")
+        vault.seal("b", b"b2")
+        vault.set_active("a", 1)
+        self.assertEqual(vault.active("a"), 1)
+        self.assertEqual(vault.active("b"), 2)
+        reopened = self.open_vault()
+        self.assertEqual(reopened.active("a"), 1)
+        self.assertEqual(reopened.active("b"), 2)
+
+    def test_revoking_pointed_version_afterwards_keeps_pointer(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.set_active("k", 1)
+        # Revocation never moves the active pointer, including one set by a
+        # redirection; revoked material stays readable.
+        vault.revoke("k", 1)
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(vault.load("k"), b"v1")
+        self.assertTrue(vault.is_revoked("k", 1))
+        vault.reload()
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(self.open_vault().active("k"), 1)
+
+
+class TestSetActiveErrors(VaultTestCase):
+    def test_unknown_key_raises_key_error(self):
+        vault = self.open_vault()
+        with self.assertRaises(KeyError):
+            vault.set_active("never-sealed", 1)
+
+    def test_nonexistent_version_raises_key_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        for bad in (0, 3, -1, 99):
+            with self.assertRaises(KeyError, msg=repr(bad)):
+                vault.set_active("k", bad)
+
+    def test_empty_key_id_raises_value_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        with self.assertRaises(ValueError):
+            vault.set_active("", 1)
+
+    def test_non_integer_version_raises_type_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        for bad in (1.0, 2.5, True, False, "1", None, (1,)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.set_active("k", bad)
+
+    def test_non_integer_version_rejected_even_for_unknown_key(self):
+        vault = self.open_vault()
+        with self.assertRaises(TypeError):
+            vault.set_active("never-sealed", 1.5)
+        with self.assertRaises(TypeError):
+            vault.set_active("never-sealed", True)
+
+    def test_pointing_at_current_active_raises_value_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        with self.assertRaises(ValueError):
+            vault.set_active("k", 2)
+        vault.set_active("k", 1)
+        with self.assertRaises(ValueError):
+            vault.set_active("k", 1)
+        # A different historical version is still fine.
+        vault.set_active("k", 2)
+        self.assertEqual(vault.active("k"), 2)
+
+    def test_pointing_at_revoked_version_raises_value_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.revoke("k", 1)
+        with self.assertRaises(ValueError):
+            vault.set_active("k", 1)
+        self.assertEqual(vault.active("k"), 2)
+
+    def test_failed_redirection_appends_nothing(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        # The file must not even be created by a rejected first call.
+        self.assertFalse(self.activations_path().exists())
+        for call in (
+            lambda: vault.set_active("", 1),
+            lambda: vault.set_active("k", 1.0),
+            lambda: vault.set_active("k", True),
+            lambda: vault.set_active("never-sealed", 1),
+            lambda: vault.set_active("k", 99),
+            lambda: vault.set_active("k", 2),  # already active
+        ):
+            with self.assertRaises((KeyError, ValueError, TypeError)):
+                call()
+        self.assertFalse(self.activations_path().exists())
+        self.assertEqual(vault.active("k"), 2)
+        self.assertEqual(vault.load("k"), b"v2")
+        # The vault is still fully usable and the first real redirection
+        # creates the file.
+        vault.set_active("k", 1)
+        self.assertTrue(self.activations_path().exists())
+        self.assertEqual(vault.active("k"), 1)
+
+    def test_failed_redirection_after_prior_ones_adds_no_line(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.seal("k", b"v3")
+        vault.set_active("k", 1)
+        before = self.activations_path().read_bytes()
+        with self.assertRaises(ValueError):
+            vault.set_active("k", 1)  # already active
+        vault.revoke("k", 2)
+        # v2 is now revoked: pointing at it must fail and append nothing.
+        with self.assertRaises(ValueError):
+            vault.set_active("k", 2)
+        with self.assertRaises(KeyError):
+            vault.set_active("k", 99)
+        self.assertEqual(self.activations_path().read_bytes(), before)
+        self.assertEqual(vault.active("k"), 1)
+        # Keys already in hand stay readable, the revoked one included.
+        self.assertEqual(vault.load("k", 2), b"v2")
+        self.assertEqual(vault.load("k", 3), b"v3")
+
+
+class TestActivationsJournalValidation(VaultTestCase):
+    def _write_activations(self, lines: bytes | list[bytes]) -> None:
+        path = self.activations_path()
+        if isinstance(lines, bytes):
+            path.write_bytes(lines)
+        else:
+            path.write_bytes(b"".join(lines))
+
+    def _record(self, **overrides) -> bytes:
+        record = {"key_id": "k", "version": 1, "tip": 2}
+        record.update(overrides)
+        return (json.dumps(record) + "\n").encode("utf-8")
+
+    def test_corrupt_line_makes_reload_fail_but_keeps_snapshot(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        vault.set_active("k", 1)
+        self._write_activations(b"{not json\n")
+        with self.assertRaises(ValueError):
+            vault.reload()
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(vault.load("k"), b"m1")
+
+    def test_record_pointing_at_unknown_version_is_rejected(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        self._write_activations([self._record(version=5)])
+        with self.assertRaises(ValueError):
+            vault.reload()
+        self.assertEqual(vault.active("k"), 2)
+
+    def test_record_against_unknown_tip_is_rejected(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        self._write_activations([self._record(version=1, tip=5)])
+        with self.assertRaises(ValueError):
+            vault.reload()
+
+    def test_record_for_unknown_key_is_rejected(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        self._write_activations([self._record(key_id="ghost")])
+        with self.assertRaises(ValueError):
+            vault.reload()
+
+    def test_malformed_records_are_rejected(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        bad_payloads = [
+            b"[1, 2]\n",
+            self._record(key_id=""),
+            self._record(version="1"),
+            self._record(tip="2"),
+            b'{"key_id": "k", "version": 1}\n',
+            b'{"version": 1, "tip": 2}\n',
+            b'{"key_id": "k", "tip": 2}\n',
+            b"\n",
+            b"\xff\xfe\n",
+        ]
+        for payload in bad_payloads:
+            self._write_activations([payload])
+            with self.assertRaises(ValueError, msg=payload):
+                vault.reload()
+            # The rejected reload neither moved the pointer nor disturbed
+            # the materials already in hand.
+            self.assertEqual(vault.active("k"), 2)
+            self.assertEqual(vault.load("k", 1), b"m1")
+            self.assertEqual(vault.load("k", 2), b"m2")
+
+    def test_record_superseded_by_later_seal_does_not_move_pointer(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        # Written while version 2 was the tip; a third seal has landed since
+        # (simulating an out-of-band journal plus newer manifest), so the
+        # record is spent and the active version stays at the new tip.
+        vault.seal("k", b"m3")
+        self._write_activations([self._record(version=1, tip=2)])
+        vault.reload()
+        self.assertEqual(vault.active("k"), 3)
+        self.assertEqual(vault.load("k"), b"m3")
+        self.assertEqual(self.open_vault().active("k"), 3)
+
+    def test_last_record_per_key_wins_on_reload(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        vault.seal("k", b"m3")
+        self._write_activations(
+            [
+                self._record(version=1, tip=3),
+                self._record(version=2, tip=3),
+            ]
+        )
+        vault.reload()
+        self.assertEqual(vault.active("k"), 2)
+
+    def test_failed_reload_touches_no_disk_records(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        vault.set_active("k", 1)
+        good_record = json.dumps(
+            {"key_id": "k", "version": 1, "tip": 2}, sort_keys=True
+        ).encode() + b"\n"
+        manifest_before = self.manifest_path().read_bytes()
+        self.assertEqual(self.activations_path().read_bytes(), good_record)
+        self._write_activations(b"{garbage\n")
+        activations_before = self.activations_path().read_bytes()
+        with self.assertRaises(ValueError):
+            vault.reload()
+        # Reload never writes: the manifest is not repaired and the corrupt
+        # journal is neither truncated nor restored to the good record.
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+        self.assertEqual(self.activations_path().read_bytes(), activations_before)
+        # The snapshot still reflects the earlier, valid redirection.
+        self.assertEqual(vault.active("k"), 1)
+        self.assertEqual(vault.load("k"), b"m1")
+
+    def test_corrupt_journal_blocks_reopen_without_changing_disk(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.seal("k", b"m2")
+        vault.set_active("k", 1)
+        self._write_activations(self._record(version=77))
+        disk_before = self.activations_path().read_bytes()
+        with self.assertRaises(ValueError):
+            self.open_vault()
+        self.assertEqual(self.activations_path().read_bytes(), disk_before)
+
+    def test_absent_journal_stays_absent_through_reload(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m1")
+        vault.reload()
+        self.assertFalse(self.activations_path().exists())
+        self.open_vault()
+        self.assertFalse(self.activations_path().exists())
+
+
+class TestActivationsConcurrency(VaultTestCase):
+    def _run_workers(self, workers: list[multiprocessing.Process]) -> None:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=120)
+            self.assertEqual(worker.exitcode, 0)
+
+    def test_concurrent_redirections_and_reloads_keep_journal_consistent(self):
+        vault = self.open_vault()
+        total = 16
+        for i in range(total):
+            vault.seal("k", f"m-{i}".encode("utf-8"))
+
+        procs, each = 4, 10
+        workers = [
+            multiprocessing.Process(
+                target=_set_active_worker,
+                args=(str(self.root), "k", [1 + (p % 3)], each),
+            )
+            for p in range(procs)
+        ]
+        workers += [
+            multiprocessing.Process(target=_reload_worker, args=(str(self.root), 20))
+            for _ in range(2)
+        ]
+        self._run_workers(workers)
+
+        # Every appended line is well-formed and names sealed versions and a
+        # real tip; calls that lost the race to point at the then-current
+        # active version were rejected and wrote nothing, so only an upper
+        # bound on the line count is observable.
+        records = self.activation_records()
+        versions = set(range(1, total + 1))
+        self.assertGreaterEqual(len(records), 1)
+        self.assertLessEqual(len(records), procs * each)
+        for record in records:
+            self.assertEqual(set(record), {"key_id", "version", "tip"})
+            self.assertEqual(record["key_id"], "k")
+            self.assertIn(record["version"], versions)
+            self.assertIn(record["tip"], versions)
+            self.assertLessEqual(record["version"], record["tip"])
+
+        reloaded = self.open_vault()
+        self.assertIn(reloaded.active("k"), versions)
+        self.assertEqual(reloaded.load("k"), f"m-{reloaded.active('k') - 1}".encode())
+        reloaded.reload()
+        self.assertIn(reloaded.active("k"), versions)
+
+    def test_concurrent_seals_and_redirections_never_tear(self):
+        vault = self.open_vault()
+        vault.seal("k", b"seed")
+        seal_procs, each = 3, 6
+
+        workers = [
+            multiprocessing.Process(
+                target=_seal_and_set_active_worker, args=(str(self.root), "k", each)
+            )
+            for _ in range(seal_procs)
+        ]
+        workers += [
+            multiprocessing.Process(target=_reload_worker, args=(str(self.root), 20))
+            for _ in range(2)
+        ]
+        self._run_workers(workers)
+
+        total = 1 + seal_procs * each
+        reloaded = self.open_vault()
+        self.assertEqual(reloaded.versions("k"), list(range(1, total + 1)))
+        self.assertIn(reloaded.active("k"), set(range(1, total + 1)))
+        # Every redirection record was serialised against a real sealed tip.
+        for record in self.activation_records():
+            self.assertLessEqual(record["version"], record["tip"])
+            self.assertIn(record["tip"], set(range(1, total + 1)))
 
 
 class TestSealCleanup(VaultTestCase):
