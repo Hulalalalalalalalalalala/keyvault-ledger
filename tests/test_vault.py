@@ -9,6 +9,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1689,16 +1690,31 @@ class TestWindowsLockFallback(VaultTestCase):
         self.assertEqual(state["held"], {})
 
 
-class TestCli(VaultTestCase):
-    def run_cli(self, *args: str) -> subprocess.CompletedProcess:
+class CliTestCase(VaultTestCase):
+    def run_cli(self, *args: str, root: Path | str | None = None) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         return subprocess.run(
-            [sys.executable, "-m", "keyvault_ledger", "--root", str(self.root), *args],
+            [
+                sys.executable,
+                "-m",
+                "keyvault_ledger",
+                "--root",
+                str(self.root if root is None else root),
+                *args,
+            ],
             capture_output=True,
             text=True,
             env=env,
         )
+
+    def material_file(self, name: str, data: bytes) -> Path:
+        path = Path(self._tmp.name) / name
+        path.write_bytes(data)
+        return path
+
+
+class TestCli(CliTestCase):
 
     def test_seal_versions_reload_round_trip(self):
         material = Path(self._tmp.name) / "material.bin"
@@ -1732,6 +1748,505 @@ class TestCli(VaultTestCase):
         result = self.run_cli("seal", "", "--material-file", str(material))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("error", result.stderr.lower())
+
+
+def _material_rel_path(root: Path, key_id: str, version: int) -> str:
+    manifest = json.loads((root / MANIFEST_NAME).read_bytes().decode("utf-8"))
+    for record in manifest["keys"][key_id]["versions"]:
+        if record["version"] == version:
+            return record["file"]
+    raise KeyError((key_id, version))
+
+
+class TestCliFrozenOutputs(CliTestCase):
+    """Byte-for-byte frozen baselines for the three README entry points.
+
+    Every case spawns the real ``python -m keyvault_ledger`` process in a
+    temporary vault and pins stdout, stderr and the exit code exactly,
+    including whitespace and the trailing newline.
+    """
+
+    def test_versions_on_a_brand_new_empty_root(self):
+        # A genuinely empty/absent vault directory is initialised on open,
+        # so ``versions`` succeeds and prints nothing at all.
+        result = self.run_cli("versions")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_reload_on_a_brand_new_empty_root(self):
+        result = self.run_cli("reload")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "reloaded\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_seal_prints_the_version_number_with_a_single_newline(self):
+        material = self.material_file("m.bin", b"cli-material")
+        first = self.run_cli("seal", "k", "--material-file", str(material))
+        self.assertEqual(first.returncode, 0)
+        self.assertEqual(first.stdout, "1\n")
+        self.assertEqual(first.stderr, "")
+        second = self.run_cli("seal", "k", "--material-file", str(material))
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stdout, "2\n")
+        self.assertEqual(second.stderr, "")
+
+    def test_versions_starts_at_one_and_increases_strictly(self):
+        material = self.material_file("m.bin", b"m")
+        for expected in ("1", "2", "3"):
+            result = self.run_cli("seal", "k", "--material-file", str(material))
+            self.assertEqual(result.stdout, f"{expected}\n")
+        result = self.run_cli("versions")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "k\tactive=3\tversions=1,2,3\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_versions_lines_are_sorted_and_tab_separated(self):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "alpha", "--material-file", str(material))
+        self.run_cli("seal", "alpha", "--material-file", str(material))
+        self.run_cli("seal", "beta", "--material-file", str(material))
+        result = self.run_cli("versions")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.stdout,
+            "alpha\tactive=2\tversions=1,2\n"
+            "beta\tactive=1\tversions=1\n",
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_reload_success_output_is_frozen(self):
+        self.run_cli("reload")
+        result = self.run_cli("reload")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "reloaded\n")
+        self.assertEqual(result.stderr, "")
+
+
+class TestCliSealErrors(CliTestCase):
+    def test_empty_key_id_is_rejected_byte_for_byte(self):
+        material = self.material_file("m.bin", b"m")
+        result = self.run_cli("seal", "", "--material-file", str(material))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "error: key_id must not be empty\n")
+
+    def test_empty_key_id_creates_no_new_version(self):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        before = self.run_cli("versions")
+        manifest_before = self.manifest_path().read_bytes()
+
+        result = self.run_cli("seal", "", "--material-file", str(material))
+        self.assertEqual(result.returncode, 1)
+
+        after = self.run_cli("versions")
+        self.assertEqual(after.stdout, before.stdout)
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+
+    def test_missing_material_file_is_rejected_with_its_path(self):
+        missing = Path(self._tmp.name) / "absent.bin"
+        result = self.run_cli("seal", "k", "--material-file", str(missing))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            f"error: [Errno 2] No such file or directory: '{missing}'\n",
+        )
+
+    def test_material_file_that_is_a_directory_is_rejected(self):
+        directory = Path(self._tmp.name) / "a-dir"
+        directory.mkdir()
+        result = self.run_cli("seal", "k", "--material-file", str(directory))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, f"error: [Errno 21] Is a directory: '{directory}'\n"
+        )
+
+    @unittest.skipUnless(
+        hasattr(os, "geteuid") and os.geteuid() != 0,
+        "permission bits are not enforced for root",
+    )
+    def test_unreadable_material_file_is_rejected(self):
+        locked = self.material_file("locked.bin", b"secret")
+        locked.chmod(0o000)
+        self.addCleanup(lambda: locked.chmod(0o644))
+        result = self.run_cli("seal", "k", "--material-file", str(locked))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            f"error: [Errno 13] Permission denied: '{locked}'\n",
+        )
+
+    def test_failed_seal_leaves_no_half_version_and_manifest_only_grew(self):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        listing_before = self.run_cli("versions")
+        manifest_before = self.manifest_path().read_bytes()
+        materials_before = sorted(
+            path.read_bytes()
+            for path in (self.root / MATERIALS_DIR).rglob("*.bin")
+        )
+
+        missing = Path(self._tmp.name) / "absent.bin"
+        failed_missing = self.run_cli(
+            "seal", "k", "--material-file", str(missing)
+        )
+        failed_empty = self.run_cli(
+            "seal", "", "--material-file", str(material)
+        )
+        self.assertEqual((failed_missing.returncode, failed_empty.returncode), (1, 1))
+
+        listing_after = self.run_cli("versions")
+        self.assertEqual(listing_after.returncode, 0)
+        self.assertEqual(listing_after.stdout, listing_before.stdout)
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+        materials_after = sorted(
+            path.read_bytes()
+            for path in (self.root / MATERIALS_DIR).rglob("*.bin")
+        )
+        self.assertEqual(materials_after, materials_before)
+
+        # The next successful seal takes version 2, not a reused number.
+        again = self.run_cli("seal", "k", "--material-file", str(material))
+        self.assertEqual(again.stdout, "2\n")
+
+
+class TestCliManifestMissing(CliTestCase):
+    def _assert_manifest_missing(self, root: Path, material: Path) -> None:
+        expected = f"error: manifest missing: {root / MANIFEST_NAME}\n"
+        for argv in (
+            ("versions",),
+            ("reload",),
+            ("seal", "k", "--material-file", str(material)),
+        ):
+            result = self.run_cli(*argv, root=root)
+            self.assertEqual(result.returncode, 1, argv)
+            self.assertEqual(result.stdout, "", argv)
+            self.assertEqual(result.stderr, expected, argv)
+
+    def test_populated_directory_without_manifest_errors_for_all_entries(self):
+        # Baseline: opening a directory that already holds unrelated content
+        # but no manifest is treated as corruption, not as a new vault.  The
+        # missing-manifest error is frozen as-is; the CLI does not silently
+        # create a manifest to repair it.
+        root = Path(self._tmp.name) / "stray"
+        root.mkdir()
+        (root / "notes.txt").write_bytes(b"not a vault")
+        material = self.material_file("m.bin", b"m")
+
+        self._assert_manifest_missing(root, material)
+        self.assertFalse((root / MANIFEST_NAME).exists())
+
+    def test_initialized_vault_with_manifest_deleted_errors_for_all_entries(
+        self,
+    ):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        self.manifest_path().unlink()
+
+        self._assert_manifest_missing(self.root, material)
+        self.assertFalse(self.manifest_path().exists())
+
+
+class TestCliReloadFailure(CliTestCase):
+    def test_missing_material_fails_and_does_not_touch_disk(self):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        rel = _material_rel_path(self.root, "k", 1)
+        material_path = self.root / rel
+        material_path.unlink()
+        manifest_before = self.manifest_path().read_bytes()
+
+        result = self.run_cli("reload")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "error: material missing for key 'k' version 1\n"
+        )
+        # Reload never writes: the manifest is byte-identical and stays.
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+
+    def test_failed_reload_is_deterministic_and_versions_match_after_repair(self):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        healthy = self.run_cli("versions")
+        self.assertEqual(healthy.stdout, "k\tactive=1\tversions=1\n")
+
+        rel = _material_rel_path(self.root, "k", 1)
+        material_path = self.root / rel
+        material_path.unlink()
+        manifest_before = self.manifest_path().read_bytes()
+
+        first = self.run_cli("reload")
+        second = self.run_cli("reload")
+        # Repeating the same failing input gives identical output and code.
+        self.assertEqual(first.returncode, 1)
+        self.assertEqual(second.returncode, 1)
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertEqual(first.stderr, second.stderr)
+
+        # A fresh process re-validates on open, so versions reports the same
+        # failure while the on-disk manifest stays exactly where it was.
+        listing = self.run_cli("versions")
+        self.assertEqual(listing.returncode, 1)
+        self.assertEqual(listing.stdout, "")
+        self.assertEqual(listing.stderr, first.stderr)
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+
+        # Once the material is restored, versions is byte-identical to what
+        # it showed before the failed reloads.
+        material_path.write_bytes(b"m")
+        recovered = self.run_cli("versions")
+        self.assertEqual(recovered.returncode, 0)
+        self.assertEqual(recovered.stdout, healthy.stdout)
+        self.assertEqual(recovered.stderr, "")
+        reloaded = self.run_cli("reload")
+        self.assertEqual(reloaded.returncode, 0)
+        self.assertEqual(reloaded.stdout, "reloaded\n")
+
+    def test_material_mismatch_fails_without_touching_disk(self):
+        material = self.material_file("m.bin", b"original")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        rel = _material_rel_path(self.root, "k", 1)
+        material_path = self.root / rel
+        material_path.write_bytes(b"tampered")
+        manifest_before = self.manifest_path().read_bytes()
+
+        result = self.run_cli("reload")
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "error: material mismatch for key 'k' version 1\n"
+        )
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+
+    def test_unsupported_manifest_format_is_rejected_for_reload_and_versions(
+        self,
+    ):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        manifest = self.disk_manifest()
+        manifest["format"] = 999
+        self.manifest_path().write_text(json.dumps(manifest))
+        frozen = "error: manifest format invalid: unsupported format\n"
+
+        reload_result = self.run_cli("reload")
+        self.assertEqual(reload_result.returncode, 1)
+        self.assertEqual(reload_result.stdout, "")
+        self.assertEqual(reload_result.stderr, frozen)
+
+        versions_result = self.run_cli("versions")
+        self.assertEqual(versions_result.returncode, 1)
+        self.assertEqual(versions_result.stdout, "")
+        self.assertEqual(versions_result.stderr, frozen)
+
+
+class TestCliVaultDirectoryProblems(CliTestCase):
+    def test_root_that_is_a_file_is_rejected_by_every_entry(self):
+        material = self.material_file("m.bin", b"m")
+        root = Path(self._tmp.name) / "a-file"
+        root.write_bytes(b"not a directory")
+        expected = f"error: [Errno 17] File exists: '{root}'\n"
+        for argv in (
+            ("versions",),
+            ("reload",),
+            ("seal", "k", "--material-file", str(material)),
+        ):
+            result = self.run_cli(*argv, root=root)
+            self.assertEqual(result.returncode, 1, argv)
+            self.assertEqual(result.stdout, "", argv)
+            self.assertEqual(result.stderr, expected, argv)
+
+    @unittest.skipUnless(
+        hasattr(os, "geteuid") and os.geteuid() != 0,
+        "permission bits are not enforced for root",
+    )
+    def test_root_under_a_non_writable_parent_is_rejected(self):
+        parent = Path(self._tmp.name) / "ro-parent"
+        parent.mkdir()
+        parent.chmod(0o555)
+        self.addCleanup(lambda: parent.chmod(0o755))
+        root = parent / "vault"
+        material = self.material_file("m.bin", b"m")
+
+        result = self.run_cli(
+            "seal", "k", "--material-file", str(material), root=root
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, f"error: [Errno 13] Permission denied: '{root}'\n"
+        )
+
+    @unittest.skipUnless(
+        hasattr(os, "geteuid") and os.geteuid() != 0,
+        "permission bits are not enforced for root",
+    )
+    def test_read_only_initialized_vault_reads_work_but_seal_fails(self):
+        material = self.material_file("m.bin", b"m")
+        self.run_cli("seal", "k", "--material-file", str(material))
+        self.root.chmod(0o555)
+        self.addCleanup(lambda: self.root.chmod(0o755))
+
+        versions = self.run_cli("versions")
+        self.assertEqual(versions.returncode, 0)
+        self.assertEqual(versions.stdout, "k\tactive=1\tversions=1\n")
+        self.assertEqual(versions.stderr, "")
+
+        reloaded = self.run_cli("reload")
+        self.assertEqual(reloaded.returncode, 0)
+        self.assertEqual(reloaded.stdout, "reloaded\n")
+        self.assertEqual(reloaded.stderr, "")
+
+        sealed = self.run_cli("seal", "k", "--material-file", str(material))
+        self.assertEqual(sealed.returncode, 1)
+        self.assertEqual(sealed.stdout, "")
+        # The temp file name carries the process id, so pin the fixed text
+        # around it rather than the pid.
+        self.assertRegex(
+            sealed.stderr,
+            r"^error: \[Errno 13\] Permission denied: '"
+            + re.escape(str(self.root / "manifest.json.tmp."))
+            + r"\d+'\n$",
+        )
+        # The failed write added no version.
+        still = self.run_cli("versions")
+        self.assertEqual(still.stdout, "k\tactive=1\tversions=1\n")
+
+
+class TestCliDeterminism(CliTestCase):
+    def _scripted_run(self, root: Path, missing: Path) -> list[tuple[int, str, str]]:
+        material = Path(self._tmp.name) / "shared-material.bin"
+        material.write_bytes(b"m")
+        captured: list[tuple[int, str, str]] = []
+        for argv in (
+            ("versions",),
+            ("reload",),
+            ("seal", "alpha", "--material-file", str(material)),
+            ("seal", "alpha", "--material-file", str(material)),
+            ("seal", "beta", "--material-file", str(material)),
+            ("versions",),
+            ("reload",),
+            ("seal", "alpha", "--material-file", str(missing)),
+            ("seal", "", "--material-file", str(material)),
+        ):
+            result = self.run_cli(*argv, root=root)
+            captured.append((result.returncode, result.stdout, result.stderr))
+        return captured
+
+    def test_same_inputs_in_two_fresh_vaults_yield_identical_outputs(self):
+        missing = Path(self._tmp.name) / "absent.bin"
+        root_a = Path(self._tmp.name) / "a"
+        root_b = Path(self._tmp.name) / "b"
+        self.assertEqual(
+            self._scripted_run(root_a, missing),
+            self._scripted_run(root_b, missing),
+        )
+
+
+class TestCliInvocationShape(CliTestCase):
+    """The README entry-point names, arguments and call shape are frozen."""
+
+    def test_missing_root_exits_two_with_frozen_usage(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [sys.executable, "-m", "keyvault_ledger", "versions"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "usage: keyvault_ledger [-h] --root ROOT "
+            "{versions,seal,reload} ...\n"
+            "keyvault_ledger: error: the following arguments are "
+            "required: --root\n",
+        )
+
+    def test_unknown_subcommand_exits_two_with_frozen_usage(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "keyvault_ledger",
+                "--root",
+                str(self.root),
+                "bogus",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "usage: keyvault_ledger [-h] --root ROOT "
+            "{versions,seal,reload} ...\n"
+            "keyvault_ledger: error: argument command: invalid choice: "
+            "'bogus' (choose from versions, seal, reload)\n",
+        )
+
+    def test_seal_without_material_file_exits_two_with_frozen_usage(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "keyvault_ledger",
+                "--root",
+                str(self.root),
+                "seal",
+                "k",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "usage: keyvault_ledger seal [-h] --material-file MATERIAL_FILE "
+            "key_id\n"
+            "keyvault_ledger seal: error: the following arguments are "
+            "required: --material-file\n",
+        )
+
+    def test_seal_without_key_id_or_material_exits_two_with_frozen_usage(self):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "keyvault_ledger",
+                "--root",
+                str(self.root),
+                "seal",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr,
+            "usage: keyvault_ledger seal [-h] --material-file MATERIAL_FILE "
+            "key_id\n"
+            "keyvault_ledger seal: error: the following arguments are "
+            "required: key_id, --material-file\n",
+        )
 
 
 if __name__ == "__main__":
