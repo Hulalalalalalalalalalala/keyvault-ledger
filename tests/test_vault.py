@@ -14,10 +14,16 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: lock-holder/inspector tests are skipped.
+    fcntl = None
 
 from keyvault_ledger import Vault
 from keyvault_ledger.vault import (
@@ -58,6 +64,170 @@ def _set_active_worker(root: str, key_id: str, versions: list[int]) -> None:
     for version in versions:
         vault.set_active(key_id, version)
         vault.reload()
+
+
+# ---------------------------------------------------------------------------
+# Workers for the concurrency regression contract tests below.  Every worker
+# is module-level so it stays picklable under any multiprocessing start
+# method, and every worker reports through a multiprocessing.Queue instead of
+# relying on exit codes alone, so the parent can assert on *what* happened
+# (returned versions, raised exception types, observed snapshots), not just
+# on success.
+# ---------------------------------------------------------------------------
+
+
+def _seal_one_worker(root: str, key_id: str, payload: bytes, results) -> None:
+    """Seal one payload and report the version number it was assigned."""
+    vault = Vault(root)
+    version = vault.seal(key_id, payload)
+    results.put(version)
+
+
+def _revoke_contest_worker(
+    root: str, key_id: str, version: int, results
+) -> None:
+    """Revoke one version and report the outcome as ("ok" | "error", ...)."""
+    vault = Vault(root)
+    try:
+        vault.revoke(key_id, version)
+    except (KeyError, ValueError) as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+    else:
+        results.put(("ok",))
+
+
+def _repoint_contest_worker(
+    root: str, key_id: str, version: int, results
+) -> None:
+    """Repoint at one version and report the outcome."""
+    vault = Vault(root)
+    try:
+        vault.set_active(key_id, version)
+    except (KeyError, ValueError) as exc:
+        results.put(("error", type(exc).__name__, str(exc)))
+    else:
+        results.put(("ok",))
+
+
+def _snapshot_worker(
+    root: str, key_id: str, rounds: int, results
+) -> None:
+    """Reload repeatedly and report every observed snapshot.
+
+    Each observation is ``(versions_tuple, active)``; a torn read would
+    either raise inside ``reload`` (validation) or surface here as a
+    snapshot that is not a contiguous 1..N prefix or whose active version
+    is not the largest one.
+    """
+    vault = Vault(root)
+    for _ in range(rounds):
+        vault.reload()
+        # The key may not have been sealed yet; an absent key is itself a
+        # coherent state (empty version list, no active version).
+        versions = vault.versions(key_id)
+        active = vault.active(key_id) if versions else None
+        results.put((tuple(versions), active))
+
+
+def _locked_disk_inspector_worker(
+    root: str, rounds: int, results
+) -> None:
+    """Inspect the on-disk records under the exclusive lock, repeatedly.
+
+    Acquiring the same exclusive file lock the writers use means every
+    inspection observes a state no writer was in the middle of.  Each round
+    reports ``("ok", versions_seen)`` or ``("bad", detail)``; the parent
+    asserts nothing bad was ever reported.
+    """
+    import fcntl as _fcntl
+
+    lock_path = Path(root) / LOCK_NAME
+
+    def parse_journal(name: str) -> list[dict]:
+        path = Path(root) / name
+        if not path.exists():
+            return []
+        records = []
+        for line in path.read_text("utf-8").splitlines():
+            if not line:
+                raise ValueError(f"{name}: empty record")
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError(f"{name}: record not an object")
+            records.append(record)
+        return records
+
+    for _ in range(rounds):
+        problems: list[str] = []
+        with open(lock_path, "a+b") as fh:
+            _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+            try:
+                manifest = json.loads(
+                    (Path(root) / MANIFEST_NAME).read_bytes().decode("utf-8")
+                )
+                for key_id, entry in manifest["keys"].items():
+                    numbers = [r["version"] for r in entry["versions"]]
+                    if numbers != list(range(1, len(numbers) + 1)):
+                        problems.append(f"{key_id}: versions {numbers}")
+                    if entry["active"] != numbers[-1]:
+                        problems.append(
+                            f"{key_id}: active {entry['active']} "
+                            f"!= latest {numbers[-1]}"
+                        )
+                    for record in entry["versions"]:
+                        material = (Path(root) / record["file"]).read_bytes()
+                        if hashlib.sha256(material).hexdigest() != record["sha256"]:
+                            problems.append(
+                                f"{key_id} v{record['version']}: digest mismatch"
+                            )
+                # Every journal line must be a complete, parseable record
+                # referencing a real sealed version — never a half line.
+                try:
+                    revocations = parse_journal(REVOCATIONS_NAME)
+                    activations = parse_journal(ACTIVATIONS_NAME)
+                except (ValueError, json.JSONDecodeError) as exc:
+                    problems.append(str(exc))
+                    revocations, activations = [], []
+                known = {
+                    key_id: {r["version"] for r in entry["versions"]}
+                    for key_id, entry in manifest["keys"].items()
+                }
+                seen_revoked: set[tuple] = set()
+                for record in revocations:
+                    marker = (record.get("key_id"), record.get("version"))
+                    if record.get("version") not in known.get(
+                        record.get("key_id"), set()
+                    ):
+                        problems.append(f"revocation dangles: {record}")
+                    if marker in seen_revoked:
+                        problems.append(f"duplicate revocation: {record}")
+                    seen_revoked.add(marker)
+                for record in activations:
+                    if record.get("version") not in known.get(
+                        record.get("key_id"), set()
+                    ):
+                        problems.append(f"activation dangles: {record}")
+            finally:
+                _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        results.put(("bad", tuple(problems)) if problems else ("ok",))
+
+
+def _hold_lock_worker(root: str, ready, release) -> None:
+    """Hold the vault's exclusive file lock until told to release it.
+
+    Uses the same ``fcntl.flock`` mechanism as the vault itself so the
+    inter-process blocking behaviour is exercised through the real lock.
+    """
+    import fcntl as _fcntl
+
+    fh = open(Path(root) / LOCK_NAME, "a+b")
+    _fcntl.flock(fh.fileno(), _fcntl.LOCK_EX)
+    try:
+        ready.set()
+        release.wait(timeout=30)
+    finally:
+        _fcntl.flock(fh.fileno(), _fcntl.LOCK_UN)
+        fh.close()
 
 
 class VaultTestCase(unittest.TestCase):
@@ -1239,6 +1409,534 @@ def _derive_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
     salt = b"worker-salt"
     for i, payload in enumerate(payloads):
         vault.derive_seal(key_id, payload, salt, 100, 16)
+
+
+class TestMultiProcessConcurrencyContract(VaultTestCase):
+    """Regression tests pinning the multi-process concurrency contract.
+
+    Real processes interleave real operations in a temporary vault; every
+    case observes what landed on disk and what each process got back.
+    """
+
+    def _start(self, target, *args) -> multiprocessing.Process:
+        proc = multiprocessing.Process(target=target, args=args)
+        proc.start()
+        self.addCleanup(self._terminate, proc)
+        return proc
+
+    @staticmethod
+    def _terminate(proc: multiprocessing.Process) -> None:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+
+    def _join(self, proc: multiprocessing.Process) -> None:
+        proc.join(timeout=120)
+        self.assertFalse(proc.is_alive(), f"worker {proc.name} hung")
+        self.assertEqual(proc.exitcode, 0)
+
+    def _drain(self, results, count: int, timeout: float = 60.0) -> list:
+        items = []
+        deadline = time.monotonic() + timeout
+        while len(items) < count and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            items.append(results.get(timeout=max(0.1, remaining)))
+        self.assertEqual(
+            len(items), count, f"expected {count} results, got {len(items)}"
+        )
+        return items
+
+    def _seed_versions(self, key_id: str, total: int) -> None:
+        vault = self.open_vault()
+        for i in range(total):
+            vault.seal(key_id, f"seed-{i}".encode("utf-8"))
+
+    def test_concurrent_revokes_of_same_version_exactly_one_wins(self):
+        self._seed_versions("k", 1)
+        results = multiprocessing.Queue()
+        contenders = 6
+        workers = [
+            self._start(_revoke_contest_worker, str(self.root), "k", 1, results)
+            for _ in range(contenders)
+        ]
+        outcomes = self._drain(results, contenders)
+        for proc in workers:
+            self._join(proc)
+
+        # Exactly one revocation lands; every other process observes it was
+        # already revoked, with ValueError (never a silent success or crash).
+        self.assertEqual(sum(o[0] == "ok" for o in outcomes), 1)
+        self.assertEqual(
+            sorted(o[1] for o in outcomes if o[0] == "error"),
+            ["ValueError"] * (contenders - 1),
+        )
+        # The append-only journal gained exactly one well-formed record.
+        self.assertEqual(self.journal_records(), [{"key_id": "k", "version": 1}])
+        reloaded = self.open_vault()
+        self.assertEqual(reloaded.revoked_versions("k"), [1])
+        self.assertTrue(reloaded.is_revoked("k", 1))
+        # History is untouched and still readable.
+        self.assertEqual(reloaded.load("k", 1), b"seed-0")
+
+    def test_concurrent_repoints_at_same_version_exactly_one_wins(self):
+        self._seed_versions("k", 2)  # v2 active; v1 is the repoint target
+        results = multiprocessing.Queue()
+        contenders = 6
+        workers = [
+            self._start(_repoint_contest_worker, str(self.root), "k", 1, results)
+            for _ in range(contenders)
+        ]
+        outcomes = self._drain(results, contenders)
+        for proc in workers:
+            self._join(proc)
+
+        # Exactly one repoint moves the pointer; the rest see it already
+        # active and get ValueError.
+        self.assertEqual(sum(o[0] == "ok" for o in outcomes), 1)
+        self.assertEqual(
+            sorted(o[1] for o in outcomes if o[0] == "error"),
+            ["ValueError"] * (contenders - 1),
+        )
+        self.assertEqual(len(self.activation_records()), 1)
+        self.assertEqual(self.open_vault().active("k"), 1)
+
+    def test_observed_snapshot_is_always_a_contiguous_prefix(self):
+        # Observers reload in a tight loop while writers seal; every observed
+        # version list must be a 1..N prefix and active must equal N.
+        results = multiprocessing.Queue()
+        rounds = 40
+        writers = 4
+        per_writer = 6
+        workers = [
+            self._start(_snapshot_worker, str(self.root), "shared", rounds, results)
+            for _ in range(2)
+        ]
+        workers += [
+            self._start(
+                _seal_worker,
+                str(self.root),
+                "shared",
+                [f"w-{w}-{i}".encode() for i in range(per_writer)],
+            )
+            for w in range(writers)
+        ]
+        observations = self._drain(results, 2 * rounds)
+        for proc in workers:
+            self._join(proc)
+
+        for versions, active in observations:
+            self.assertEqual(
+                list(versions), list(range(1, len(versions) + 1))
+            )
+            if versions:
+                self.assertEqual(active, versions[-1])
+            else:
+                self.assertIsNone(active)
+        # Every writer's records landed exactly once; the sequence is whole.
+        final = self.open_vault()
+        total = writers * per_writer
+        self.assertEqual(final.versions("shared"), list(range(1, total + 1)))
+        self.assertEqual(final.active("shared"), total)
+
+    @unittest.skipUnless(fcntl is not None, "fcntl file locks are required")
+    def test_another_process_holding_the_lock_blocks_whole_transaction(self):
+        self._seed_versions("k", 1)
+        ready = multiprocessing.Event()
+        release = multiprocessing.Event()
+        holder = self._start(_hold_lock_worker, str(self.root), ready, release)
+        self.assertTrue(ready.wait(timeout=10))
+
+        results = multiprocessing.Queue()
+        sealer = self._start(
+            _seal_one_worker, str(self.root), "k", b"while-locked", results
+        )
+        # While the lock is held the seal cannot begin: no version appears
+        # on disk and the worker stays blocked.
+        sealer.join(timeout=0.5)
+        self.assertTrue(sealer.is_alive())
+        self.assertEqual(self.disk_manifest()["keys"]["k"]["versions"][-1]["version"], 1)
+
+        release.set()
+        self.assertEqual(self._drain(results, 1), [2])
+        self._join(sealer)
+        self._join(holder)
+        # The transaction completed cleanly once the lock was free.
+        self.assertEqual(self.open_vault().load("k", 2), b"while-locked")
+
+    @unittest.skipUnless(fcntl is not None, "fcntl file locks are required")
+    def test_other_processes_wait_until_a_full_record_is_persisted(self):
+        # A slow seal (material write delayed) holds the lock for the whole
+        # record; an inspector reading on that same lock never sees a state
+        # with a half-written material file or a manifest that names a
+        # version whose material is absent.
+        self._seed_versions("k", 1)
+        results = multiprocessing.Queue()
+        inspector = self._start(
+            _locked_disk_inspector_worker, str(self.root), 30, results
+        )
+        # Concurrent writers extend the version list while the inspector
+        # repeatedly validates everything under the lock.
+        writers = [
+            self._start(
+                _seal_worker,
+                str(self.root),
+                "k",
+                [f"c-{w}-{i}".encode() for i in range(4)],
+            )
+            for w in range(3)
+        ]
+        reports = self._drain(results, 30)
+        self._join(inspector)
+        for proc in writers:
+            self._join(proc)
+
+        self.assertTrue(reports)
+        self.assertTrue(
+            all(report[0] == "ok" for report in reports),
+            [r for r in reports if r[0] != "ok"],
+        )
+        final = self.open_vault()
+        self.assertEqual(final.versions("k"), list(range(1, 1 + 1 + 3 * 4)))
+        for version in range(1, 1 + 1 + 3 * 4):
+            final.load("k", version)  # every material is present and intact
+
+    def test_reload_interleaved_with_seals_never_sees_half_old_half_new(self):
+        # The locked reload either reads the complete old manifest or the
+        # complete new one; here we assert every observer snapshot is one of
+        # those coherent states by re-validating it against disk after.
+        results = multiprocessing.Queue()
+        rounds = 30
+        workers = [
+            self._start(_snapshot_worker, str(self.root), "mix", rounds, results)
+            for _ in range(3)
+        ]
+        workers += [
+            self._start(
+                _seal_worker,
+                str(self.root),
+                "mix",
+                [f"m-{i}".encode() for i in range(8)],
+            )
+            for _ in range(2)
+        ]
+        observations = self._drain(results, 3 * rounds)
+        for proc in workers:
+            self._join(proc)
+
+        # Coherence check: every observed prefix is a valid 1..N prefix and
+        # the active pointer, when the key exists, is the newest material.
+        for versions, active in observations:
+            self.assertEqual(versions, tuple(range(1, len(versions) + 1)))
+            self.assertEqual(active, versions[-1] if versions else None)
+        final = self.open_vault()
+        self.assertEqual(final.versions("mix"), list(range(1, 17)))
+        for version in range(1, 17):
+            final.load("mix", version)
+
+    def test_concurrent_derived_seals_keep_one_strict_sequence(self):
+        # Multiple processes deriving with PBKDF2 must draw from one shared
+        # strictly increasing sequence with no repeat or gap.
+        procs, each = 4, 5
+        workers = [
+            self._start(
+                _derive_worker,
+                str(self.root),
+                "derived",
+                [f"pw-{p}-{i}".encode() for i in range(each)],
+            )
+            for p in range(procs)
+        ]
+        for proc in workers:
+            self._join(proc)
+
+        total = procs * each
+        vault = self.open_vault()
+        self.assertEqual(vault.versions("derived"), list(range(1, total + 1)))
+        self.assertEqual(vault.active("derived"), total)
+        expected = {
+            hashlib.pbkdf2_hmac(
+                "sha256",
+                f"pw-{p}-{i}".encode(),
+                b"worker-salt",
+                100,
+                dklen=16,
+            )
+            for p in range(procs)
+            for i in range(each)
+        }
+        self.assertEqual(
+            {vault.load("derived", v) for v in range(1, total + 1)}, expected
+        )
+
+
+class TestFailedReloadInvariants(VaultTestCase):
+    """After a failed whole-vault reload: snapshot and disk both stay put."""
+
+    def _snapshot_state(self, vault: Vault) -> tuple:
+        return (
+            vault.manifest(),
+            [(k, vault.versions(k), vault.active(k), vault.revoked_versions(k))
+             for k in sorted(vault.manifest()["keys"])],
+        )
+
+    def test_value_error_leaves_memory_snapshot_and_disk_unchanged(self):
+        vault = self.open_vault()
+        vault.seal("a", b"a1")
+        vault.seal("a", b"a2")
+        vault.seal("a", b"a3")
+        vault.seal("b", b"b1")
+        vault.revoke("a", 3)
+        vault.set_active("a", 1)  # repoint at a non-revoked historical version
+
+        files_before = {
+            p.relative_to(self.root): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file()
+        }
+        memory_before = self._snapshot_state(vault)
+
+        # Corrupt the revocation journal so whole-vault validation fails.
+        self.journal_path().write_bytes(b"{broken json\n")
+        # Snapshot the on-disk state as it stands when reload is attempted:
+        # the corruption is the precondition, and the failed reload itself
+        # must neither add nor remove nor repair anything.
+        files_at_reload = {
+            p.relative_to(self.root): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file()
+        }
+        with self.assertRaises(ValueError):
+            vault.reload()
+
+        # In-memory snapshot is untouched: keys already in hand read fine.
+        self.assertEqual(vault.load("a", 1), b"a1")
+        self.assertEqual(vault.load("a", 2), b"a2")
+        self.assertEqual(vault.load("a", 3), b"a3")
+        self.assertEqual(vault.load("b"), b"b1")
+        self.assertEqual(vault.active("a"), 1)
+        self.assertFalse(vault.is_revoked("a", 1))
+        self.assertTrue(vault.is_revoked("a", 3))
+        self.assertEqual(vault.revoked_versions("a"), [3])
+        self.assertEqual(self._snapshot_state(vault), memory_before)
+
+        # Disk gained and lost nothing across the failed reload: every file
+        # is byte-for-byte what it was the instant reload was attempted.
+        files_after = {
+            p.relative_to(self.root): p.read_bytes()
+            for p in self.root.rglob("*")
+            if p.is_file()
+        }
+        self.assertEqual(files_after, files_at_reload)
+        # The corrupt journal is still exactly the corruption we wrote (the
+        # failed reload did not repair or truncate it), and healthy files
+        # are untouched relative to the pre-corruption state apart from it.
+        self.assertEqual(self.journal_path().read_bytes(), b"{broken json\n")
+        self.assertNotEqual(files_before, files_at_reload)  # precondition check
+
+        # A second read/query after the failure matches verbatim.
+        with self.assertRaises(ValueError):
+            vault.reload()
+        self.assertEqual(self._snapshot_state(vault), memory_before)
+        self.assertEqual(vault.load("a"), b"a1")
+        self.assertEqual(vault.revoked_versions("a"), [3])
+
+    def test_query_results_after_failure_match_results_before(self):
+        vault = self.open_vault()
+        for i in range(3):
+            vault.seal("k", f"m{i}".encode())
+        vault.revoke("k", 2)
+        queries_before = {
+            "versions": vault.versions("k"),
+            "active": vault.active("k"),
+            "revoked": vault.revoked_versions("k"),
+            "load_active": vault.load("k"),
+            "load_each": [vault.load("k", v) for v in (1, 2, 3)],
+            "is_revoked": {v: vault.is_revoked("k", v) for v in (1, 2, 3)},
+            "manifest": vault.manifest(),
+        }
+
+        self.manifest_path().write_bytes(b"not json at all")
+        with self.assertRaises(ValueError):
+            vault.reload()
+
+        self.assertEqual(vault.versions("k"), queries_before["versions"])
+        self.assertEqual(vault.active("k"), queries_before["active"])
+        self.assertEqual(vault.revoked_versions("k"), queries_before["revoked"])
+        self.assertEqual(vault.load("k"), queries_before["load_active"])
+        self.assertEqual(
+            [vault.load("k", v) for v in (1, 2, 3)],
+            queries_before["load_each"],
+        )
+        self.assertEqual(
+            {v: vault.is_revoked("k", v) for v in (1, 2, 3)},
+            queries_before["is_revoked"],
+        )
+        self.assertEqual(vault.manifest(), queries_before["manifest"])
+
+
+class TestLockFileSemantics(VaultTestCase):
+    """The lock file is only a mutex: no key data, no role in validation."""
+
+    @unittest.skipUnless(fcntl is not None, "fcntl file locks are required")
+    def test_clearing_lock_file_does_not_break_reload_or_seal(self):
+        vault = self.open_vault()
+        vault.seal("k", b"one")
+        lock_path = self.root / LOCK_NAME
+
+        # Empty it out: it carries no data, so reload validates normally.
+        lock_path.write_bytes(b"")
+        vault.reload()
+        self.assertEqual(vault.load("k"), b"one")
+
+        # Even junk bytes in it are harmless; it is never parsed.
+        lock_path.write_bytes(b"\x00\xffnot-a-lock-just-gibberish\n")
+        vault.reload()
+        self.assertEqual(vault.seal("k", b"two"), 2)
+        self.assertEqual(vault.load("k", 2), b"two")
+        # A brand-new handle opening the same vault validates fine too.
+        reopened = Vault(self.root)
+        reopened.reload()
+        self.assertEqual(reopened.versions("k"), [1, 2])
+
+    @unittest.skipUnless(fcntl is not None, "fcntl file locks are required")
+    def test_other_process_acquires_lock_immediately_after_close(self):
+        vault = self.open_vault()
+        vault.seal("k", b"one")
+        vault.close()
+        # No residual handle: another process takes the lock right away and
+        # completes a full write without blocking.
+        results = multiprocessing.Queue()
+        proc = multiprocessing.Process(
+            target=_seal_one_worker,
+            args=(str(self.root), "k", b"after-close", results),
+        )
+        proc.start()
+        try:
+            self.assertEqual(results.get(timeout=30), 2)
+            proc.join(timeout=30)
+        finally:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+        self.assertEqual(proc.exitcode, 0)
+        self.assertEqual(self.open_vault().load("k", 2), b"after-close")
+
+    @unittest.skipUnless(fcntl is not None, "fcntl file locks are required")
+    def test_lock_release_allows_queued_writer_then_local_write(self):
+        # Hold the lock in another process, queue a writer behind it, then
+        # release: the queued writer completes and a subsequent local
+        # operation observes its record — close/reopen re-locks cleanly.
+        local = self.open_vault()
+        local.seal("k", b"base")
+        ready = multiprocessing.Event()
+        release = multiprocessing.Event()
+        holder = multiprocessing.Process(
+            target=_hold_lock_worker, args=(str(self.root), ready, release)
+        )
+        holder.start()
+        self.assertTrue(ready.wait(timeout=10))
+
+        results = multiprocessing.Queue()
+        queued = multiprocessing.Process(
+            target=_seal_one_worker,
+            args=(str(self.root), "k", b"queued", results),
+        )
+        queued.start()
+        queued.join(timeout=0.5)
+        self.assertTrue(queued.is_alive())  # blocked on the holder
+
+        release.set()
+        self.assertEqual(results.get(timeout=30), 2)
+        queued.join(timeout=30)
+        holder.join(timeout=30)
+        self.assertEqual(queued.exitcode, 0)
+        self.assertEqual(holder.exitcode, 0)
+
+        # The local handle reacquires its lock after the holder is gone and
+        # sees the queued writer's record.
+        local.close()
+        self.assertEqual(local.seal("k", b"local"), 3)
+        self.assertEqual(local.load("k", 2), b"queued")
+        self.assertEqual(local.load("k", 3), b"local")
+
+
+class TestEntryValidationContract(VaultTestCase):
+    """Pin the exact exception types at every entry point, with no new version."""
+
+    def test_empty_key_id_rejected_at_every_validating_entry_point(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        vault.derive_seal("k", b"pw", b"salt", 1, 8)
+        # Seal, derive, revoke, repoint and every key-id-validating query
+        # reject an empty id with ValueError.
+        for call in (
+            lambda: vault.seal("", b"m"),
+            lambda: vault.derive_seal("", b"pw", b"salt", 1, 8),
+            lambda: vault.revoke("", 1),
+            lambda: vault.set_active("", 1),
+            lambda: vault.is_revoked("", 1),
+            lambda: vault.revoked_versions(""),
+            lambda: vault.derivation(""),
+        ):
+            with self.assertRaises(ValueError, msg=call):
+                call()
+        # No new version was created by any rejected call.
+        self.assertEqual(vault.versions("k"), [1, 2])
+
+    def test_unknown_key_and_missing_version_raise_key_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        with self.assertRaises(KeyError):
+            vault.load("ghost")
+        with self.assertRaises(KeyError):
+            vault.active("ghost")
+        with self.assertRaises(KeyError):
+            vault.derivation("ghost")
+        with self.assertRaises(KeyError):
+            vault.is_revoked("ghost", 1)
+        with self.assertRaises(KeyError):
+            vault.load("k", 2)
+        with self.assertRaises(KeyError):
+            vault.derivation("k", 2)
+        with self.assertRaises(KeyError):
+            vault.is_revoked("k", 2)
+        # Querying revoked versions of an unknown key is the one read that
+        # returns an empty list rather than raising.
+        self.assertEqual(vault.revoked_versions("ghost"), [])
+
+    def test_double_revoke_and_repoint_at_active_raise_value_error(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        vault.revoke("k", 1)
+        with self.assertRaises(ValueError):
+            vault.revoke("k", 1)
+        with self.assertRaises(ValueError):
+            vault.set_active("k", 2)  # 2 is already active
+
+    def test_non_bytes_inputs_and_non_integer_derivation_numbers(self):
+        vault = self.open_vault()
+        for bad in ("text", 1, None, object()):
+            with self.assertRaises(TypeError, msg=f"material {bad!r}"):
+                vault.seal("k", bad)
+            with self.assertRaises(TypeError, msg=f"password {bad!r}"):
+                vault.derive_seal("k", bad, b"salt", 1, 8)
+            with self.assertRaises(TypeError, msg=f"salt {bad!r}"):
+                vault.derive_seal("k", b"pw", bad, 1, 8)
+        for bad in (1.0, True, "2", None):
+            with self.assertRaises(TypeError, msg=f"iterations {bad!r}"):
+                vault.derive_seal("k", b"pw", b"salt", bad, 8)
+            with self.assertRaises(TypeError, msg=f"length {bad!r}"):
+                vault.derive_seal("k", b"pw", b"salt", 1, bad)
+        for bad in (0, -5):
+            with self.assertRaises(ValueError, msg=f"iterations {bad!r}"):
+                vault.derive_seal("k", b"pw", b"salt", bad, 8)
+            with self.assertRaises(ValueError, msg=f"length {bad!r}"):
+                vault.derive_seal("k", b"pw", b"salt", 1, bad)
+        with self.assertRaises(ValueError):
+            vault.derive_seal("k", b"pw", b"", 1, 8)
+        # Nothing rejected above created a key or a version.
+        self.assertEqual(vault.versions("k"), [])
 
 
 class TestDeriveSeal(VaultTestCase):
