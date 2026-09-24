@@ -1247,12 +1247,16 @@ class TestWindowsLockFallback(VaultTestCase):
 
                 def hold() -> None:
                     try:
+                        # The file-lock helper's contract requires the
+                        # caller to already hold the in-process RLock, so
+                        # take it explicitly before entering _file_lock().
                         # Only the inter-process file lock is simulated by
-                        # the fake msvcrt; the in-process RLock belongs to
-                        # the main thread and must stay out of the way.
-                        with holder_vault._file_lock():
-                            holder_ready.set()
-                            release_holder.wait(timeout=5)
+                        # the fake msvcrt; the sealer uses a different
+                        # vault instance and thus a different RLock.
+                        with holder_vault._lock:
+                            with holder_vault._file_lock():
+                                holder_ready.set()
+                                release_holder.wait(timeout=5)
                     except BaseException as exc:  # captured below
                         holder_error.append(exc)
 
