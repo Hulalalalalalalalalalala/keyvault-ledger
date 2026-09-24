@@ -19,7 +19,8 @@ Python 3.11 or newer. Standard library only.
 ## Public interface
 
 `keyvault_ledger.Vault(root)` opens the vault directory `root`.
-- `seal(key_id, material) -> int` stores material and returns the new version.
+- `seal(key_id, material) -> int` stores the bytes-like material and returns
+  the new version.
 - `derive_seal(key_id, password, salt, iterations, length) -> int` derives the
   material with PBKDF2-HMAC-SHA256 (standard library), seals it through the
   ordinary append-only path, and returns the new version. The passphrase is
@@ -104,5 +105,6 @@ releases its handle; later operations reopen and relock transparently.
 
 ## Limits
 
-Key material must be supplied as bytes, or derived from a passphrase with
-`derive_seal`; there is no other derivation. No network service.
+Key material must be supplied as a bytes-like object (`bytes`, `bytearray` or
+`memoryview`; anything else raises `TypeError`), or derived from a passphrase
+with `derive_seal`; there is no other derivation. No network service.

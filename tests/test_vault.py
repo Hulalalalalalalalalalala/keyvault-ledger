@@ -1250,9 +1250,13 @@ class TestWindowsLockFallback(VaultTestCase):
                         # Only the inter-process file lock is simulated by
                         # the fake msvcrt; the in-process RLock belongs to
                         # the main thread and must stay out of the way.
-                        with holder_vault._file_lock():
-                            holder_ready.set()
-                            release_holder.wait(timeout=5)
+                        # ``_file_lock`` requires its caller to already hold
+                        # the in-process lock, so acquire it here by hand
+                        # instead of going through ``_locked``.
+                        with holder_vault._lock:
+                            with holder_vault._file_lock():
+                                holder_ready.set()
+                                release_holder.wait(timeout=5)
                     except BaseException as exc:  # captured below
                         holder_error.append(exc)
 
