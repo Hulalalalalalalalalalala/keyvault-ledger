@@ -4,9 +4,12 @@ The vault persists an append-only version manifest (``manifest.json``) plus
 one material file per sealed version under ``materials/``.  Revocations live
 in their own append-only journal (``revocations.jsonl``): revoking a version
 only appends a record, never deleting or altering historical material.
-``reload()`` re-reads and validates the whole keyring, journal included, and
-swaps the in-memory snapshot atomically; readers only ever see a complete
-old or complete new snapshot.
+Repointing the active version (``set_active``) likewise appends one record
+to its own journal (``activations.jsonl``), created on the first repoint and
+simply absent from a vault that was never repointed.  ``reload()`` re-reads
+and validates the whole keyring, both journals included, and swaps the
+in-memory snapshot atomically; readers only ever see a complete old or
+complete new snapshot.
 
 Besides direct sealing (``seal``), a version's material may be derived from
 a passphrase with PBKDF2-HMAC-SHA256 (``derive_seal``).  The passphrase
@@ -17,16 +20,16 @@ and re-checked on reload.
 
 Multiple processes may share one vault directory.  Every operation that
 reads from or writes to the disk state (open, seal, derive_seal, revoke,
-reload) runs under an exclusive, blocking file lock held on ``vault.lock``
-inside the vault directory (``fcntl.flock`` where available,
+set_active, reload) runs under an exclusive, blocking file lock held on
+``vault.lock`` inside the vault directory (``fcntl.flock`` where available,
 ``msvcrt.locking`` on Windows — standard library only).  A writer waits
 until it holds the lock and completes its whole record before releasing it,
-so interleaved seals and revokes from different processes never duplicate
-or skip a version number and never overwrite or truncate historical
-material.  The lock file is only a mutual-exclusion device: it carries no
-key data and plays no part in manifest or material validation.  ``close()``
-releases the lock file handle; the next operation reopens it and reacquires
-the same lock, with no observable change in behaviour.
+so interleaved seals, revokes and repoints from different processes never
+duplicate or skip a version number and never overwrite or truncate
+historical material.  The lock file is only a mutual-exclusion device: it
+carries no key data and plays no part in manifest or material validation.
+``close()`` releases the lock file handle; the next operation reopens it and
+reacquires the same lock, with no observable change in behaviour.
 """
 
 from __future__ import annotations
@@ -49,6 +52,7 @@ except ImportError:  # Windows: fall back to msvcrt in _file_lock.
 MANIFEST_NAME = "manifest.json"
 MATERIALS_DIR = "materials"
 REVOCATIONS_NAME = "revocations.jsonl"
+ACTIVATIONS_NAME = "activations.jsonl"
 LOCK_NAME = "vault.lock"
 FORMAT_VERSION = 1
 
@@ -265,11 +269,72 @@ class Vault:
         return sorted(entry["versions"])
 
     def active(self, key_id: str) -> int:
-        """Return the active (most recently sealed) version of ``key_id``."""
+        """Return the active version of ``key_id``.
+
+        Normally the most recently sealed version; ``set_active`` can repoint
+        it at an older historical version until the next seal.
+        """
         entry = self._snapshot.get(key_id)
         if entry is None:
             raise KeyError(key_id)
         return entry["active"]
+
+    def set_active(self, key_id: str, version: int) -> None:
+        """Repoint the active version of ``key_id`` at historical ``version``.
+
+        Appends one record to the append-only ``activations.jsonl`` journal
+        (created on the first repoint) without rewriting the manifest or any
+        material.  The last record for a key wins while it still concerns the
+        key's latest sealed version: sealing another version afterwards makes
+        that new version active again, exactly as if the key had never been
+        repointed.  Repointing at the version already active raises
+        ``ValueError``, as does repointing at a revoked version; a version
+        revoked *after* being pointed at is not an error.
+        """
+        _check_key_id(key_id)
+        _check_version(version)
+
+        with self._locked():
+            # Re-read and validate the persisted keyring under the
+            # inter-process lock, exactly like revoke: the unknown/version/
+            # revoked/active checks and the appended record must reflect the
+            # latest journals on disk, including records other processes
+            # appended.
+            snapshot, disk_manifest = self._load_validated()
+            entry = snapshot.get(key_id)
+            if entry is None:
+                raise KeyError(key_id)
+            if version not in entry["versions"]:
+                raise KeyError(f"{key_id!r} version {version!r}")
+            if version in entry["revoked"]:
+                raise ValueError(
+                    f"{key_id!r} version {version!r} is revoked"
+                )
+            if version == entry["active"]:
+                raise ValueError(
+                    f"{key_id!r} version {version!r} is already the active "
+                    "version"
+                )
+
+            # ``latest`` binds this repoint to the key's current newest
+            # sealed version.  On reload a repoint only applies while its
+            # bound latest still matches the newest sealed version, so a
+            # later seal silently supersedes it without touching this
+            # append-only journal.
+            latest = max(entry["versions"])
+            record = {"key_id": key_id, "version": version, "latest": latest}
+            line = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
+            activations_path = self._root / ACTIVATIONS_NAME
+            # Append-only; "ab" also creates the journal on the very first
+            # repoint of a vault that simply had no such file before.
+            with open(activations_path, "ab") as fh:
+                fh.write(line)
+                fh.flush()
+                os.fsync(fh.fileno())
+
+            entry["active"] = version
+            self._snapshot = snapshot
+            self._manifest = disk_manifest
 
     def revoke(self, key_id: str, version: int) -> None:
         """Mark ``version`` of ``key_id`` as revoked.
@@ -344,12 +409,12 @@ class Vault:
         """Re-read and validate the whole keyring, then swap the snapshot.
 
         Never writes to disk.  The whole read-and-validate pass happens
-        under both locks so it cannot interleave with a seal or revoke —
-        in this process or any other: the reload reads either the complete
-        old records or the complete newly persisted ones, and swapping in a
-        snapshot read before a concurrent seal completed would resurrect an
-        old snapshot and could later reuse its version numbers.  On any
-        validation failure the current in-memory snapshot is kept
+        under both locks so it cannot interleave with a seal, revoke or
+        repoint — in this process or any other: the reload reads either the
+        complete old records or the complete newly persisted ones, and
+        swapping in a snapshot read before a concurrent seal completed would
+        resurrect an old snapshot and could later reuse its version numbers.
+        On any validation failure the current in-memory snapshot is kept
         untouched.
         """
         with self._locked():
@@ -528,10 +593,12 @@ class Vault:
         """Read and validate the whole keyring from disk.
 
         Returns ``(snapshot, manifest)``.  The snapshot carries each key's
-        materials plus its revoked-version set.  Raises ``ValueError`` if
-        the manifest or the revocation journal is corrupt or malformed, a
-        stored material is missing or mismatches its record, or the
-        journal revokes an unknown/duplicate version.
+        materials plus its revoked-version set and the active version
+        implied by the append-only journals.  Raises ``ValueError`` if the
+        manifest or either journal is corrupt or malformed, a stored
+        material is missing or mismatches its record, the revocation
+        journal revokes an unknown/duplicate version, or the activation
+        journal repoints an unknown key or nonexistent version.
         """
         manifest_path = self._root / MANIFEST_NAME
         try:
@@ -655,6 +722,7 @@ class Vault:
             }
 
         self._load_revocations(snapshot)
+        self._load_activations(snapshot)
         return snapshot, manifest
 
     @staticmethod
@@ -755,3 +823,84 @@ class Vault:
                 )
             seen.add(marker)
             entry["revoked"].add(version)
+
+    def _load_activations(self, snapshot: dict[str, dict]) -> None:
+        """Validate the append-only activation journal against ``snapshot``.
+
+        The journal is absent from a vault that was never repointed; that is
+        not an error.  Each record repoints one key at a historical version
+        and records the key's newest sealed version at repoint time
+        (``latest``): the last record for a key is honoured only while its
+        ``latest`` still equals the key's newest sealed version, so a later
+        seal supersedes the repoint without the journal being touched.  A
+        repointed version that is revoked later does not move the pointer —
+        ``revoke`` never does — so a revoked target still applies here.
+        Raises ``ValueError`` if the journal is unreadable or corrupt, or if
+        a record targets a key/version that never existed.
+        """
+        journal_path = self._root / ACTIVATIONS_NAME
+        if not journal_path.exists():
+            return
+        try:
+            raw = journal_path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"activation journal unreadable: {exc}") from exc
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"activation journal corrupt: {exc}") from exc
+
+        # Only the last record per key can win, but every record must be
+        # validated, including ones already superseded by a later repoint.
+        last: dict[str, tuple[int, int]] = {}
+        for line in text.splitlines():
+            if not line:
+                raise ValueError("activation journal corrupt: empty record")
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"activation journal corrupt: {exc}") from exc
+            if not isinstance(record, dict):
+                raise ValueError("activation journal corrupt: record not an object")
+            key_id = record.get("key_id")
+            version = record.get("version")
+            latest = record.get("latest")
+            if not isinstance(key_id, str) or key_id == "":
+                raise ValueError(
+                    "activation journal corrupt: record has bad key_id"
+                )
+            if type(version) is not int:
+                raise ValueError(
+                    f"activation journal corrupt: key {key_id!r} record has "
+                    "bad version"
+                )
+            if type(latest) is not int:
+                raise ValueError(
+                    f"activation journal corrupt: key {key_id!r} record has "
+                    "bad latest"
+                )
+            entry = snapshot.get(key_id)
+            if entry is None:
+                raise ValueError(
+                    f"activation journal corrupt: key {key_id!r} was never sealed"
+                )
+            if version not in entry["versions"]:
+                raise ValueError(
+                    f"activation journal corrupt: key {key_id!r} version "
+                    f"{version} was never sealed"
+                )
+            if latest not in entry["versions"] or not (1 <= version <= latest):
+                raise ValueError(
+                    f"activation journal corrupt: key {key_id!r} record has "
+                    "bad latest"
+                )
+            last[key_id] = (version, latest)
+
+        for key_id, (version, latest) in last.items():
+            entry = snapshot[key_id]
+            if latest != max(entry["versions"]):
+                # A newer version was sealed after this repoint: sealing
+                # always makes the new version active, superseding it.
+                continue
+            entry["active"] = version
