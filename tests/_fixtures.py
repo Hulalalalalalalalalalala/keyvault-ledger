@@ -14,7 +14,10 @@ cleanup runs, in one fixed order:
 5. delete the whole temporary directory tree.  Removal is never allowed to
    fail silently: if the tree (or any part of it) survives the final
    removal attempt, the case fails with an error naming the directory that
-   could not be deleted.  When the case itself already raised (a failed
+   could not be deleted.  When the handle return above also failed, that
+   failure is named and chained in the same error — the removal failure
+   never swallows it, and a handle failure with a healthy removal is
+   reported on its own.  When the case itself already raised (a failed
    assertion or any other error), that original exception is what the
    runner reports — the cleanup neither swallows nor rewrites it.
 
@@ -198,17 +201,31 @@ class VaultFixture:
 
         if self.tmp_path.exists():
             # Name exactly which directory the cleanup could not remove and
-            # list whatever is still inside it.
+            # list whatever is still inside it.  A handle that also failed
+            # to come back is surfaced alongside -- named in the message and
+            # chained as the direct cause -- never swallowed by the removal
+            # failure.
             leftovers = sorted(
                 str(path.relative_to(self.tmp_path))
                 for path in self.tmp_path.rglob("*")
             )
-            raise AssertionError(
+            message = (
                 "teardown could not delete temporary directory "
                 f"{self.tmp_path}: remaining entries: {leftovers}"
             )
+            if handle_error is not None:
+                message += (
+                    "; the vault lock handle was not returned cleanly "
+                    f"either: {handle_error!r}"
+                )
+                raise AssertionError(message) from handle_error
+            raise AssertionError(message)
 
         if handle_error is not None:
+            if removal_error is not None:
+                # Both steps failed yet the tree is gone (a racing remover
+                # finished it): keep both failures visible, neither dropped.
+                raise removal_error from handle_error
             raise handle_error
         if removal_error is not None:
             raise removal_error

@@ -13,6 +13,16 @@ this module pins the *test-side* cleanup contract only:
 * a temporary directory that cannot be deleted is never ignored: the case
   fails with an error naming the exact directory and what remains in it;
 
+* when returning a lock handle and deleting the tree both fail, the handle
+  failure is surfaced together with the removal failure -- named in the
+  message and chained as its cause -- instead of being swallowed by it;
+  a handle failure with a healthy removal is reported on its own, and a
+  removal failure with healthy handles names only the directory;
+
+* a read-only leftover that blocks the first removal attempt is made
+  writable and the removal retried; a successful retry ends the case
+  cleanly, leaving neither the tree nor any read-only attribute behind;
+
 * when the case itself already failed an assertion (or raised anything),
   that original exception is reported verbatim -- the cleanup failure is
   surfaced too, but it neither swallows nor rewrites the original;
@@ -136,6 +146,54 @@ def _force_removal_failure(test_case: unittest.TestCase) -> VaultFixture:
     return fixture
 
 
+def _force_handle_and_removal_failure(
+    test_case: unittest.TestCase,
+) -> tuple[VaultFixture, Vault]:
+    """Give ``test_case`` a fixture whose handle return *and* tree removal
+    are both forced to fail.
+
+    Same recovery contract as :func:`_force_removal_failure`: the recovery
+    cleanup is registered before the fixture cleanup, so LIFO ordering runs
+    the (doubly failing) fixture cleanup first -- while both patches are
+    still in place -- and only then restores the real close and remover,
+    returns the handle for real and deletes the directory.  The simulated
+    double failure therefore surfaces through unittest exactly as a real
+    one would, yet leaves neither a directory nor an unclosed lock handle
+    behind.
+    """
+    rmtree_patcher = mock.patch.object(
+        shutil, "rmtree", side_effect=OSError("simulated removal failure")
+    )
+    fixture_holder: list[VaultFixture] = []
+    vault_holder: list[Vault] = []
+    close_patcher_holder: list = []
+
+    def recover() -> None:
+        rmtree_patcher.stop()
+        for close_patcher in close_patcher_holder:
+            close_patcher.stop()
+        # The simulated failures skipped the real handle return and the
+        # real removal; do both for real now, leaving nothing behind.
+        for vault in vault_holder:
+            vault.close()
+        if fixture_holder:
+            shutil.rmtree(fixture_holder[0].tmp_path, ignore_errors=True)
+
+    test_case.addCleanup(recover)
+    fixture = VaultFixture(test_case)
+    fixture_holder.append(fixture)
+    _SIMULATED_PATHS.append(fixture.tmp_path)
+    vault = fixture.open()
+    vault_holder.append(vault)
+    close_patcher = mock.patch.object(
+        vault, "close", side_effect=RuntimeError("SIMULATED-CLOSE-MARKER")
+    )
+    close_patcher_holder.append(close_patcher)
+    close_patcher.start()
+    rmtree_patcher.start()
+    return fixture, vault
+
+
 class _SimAssertThenCleanupFail(unittest.TestCase):
     """The case fails an assertion and its directory removal fails too."""
 
@@ -152,6 +210,18 @@ class _SimRaiseThenCleanupFail(unittest.TestCase):
         fixture = _force_removal_failure(self)
         fixture.open().seal("k", b"m")
         raise ValueError("ORIGINAL-VALUE-ERROR-MARKER")
+
+
+class _SimAssertThenHandleAndCleanupFail(unittest.TestCase):
+    """The case fails an assertion; teardown then fails to return the lock
+    handle AND to delete the tree.  The original assertion must stay the
+    verbatim primary failure while the teardown surfaces both of its own
+    problems together."""
+
+    def test_body(self) -> None:
+        _fixture, vault = _force_handle_and_removal_failure(self)
+        vault.seal("k", b"m")
+        self.assertTrue(False, "ORIGINAL-ASSERTION-MARKER")
 
 
 class _SimHealthyCleanup(unittest.TestCase):
@@ -291,6 +361,51 @@ class TestTeardownRemoval(unittest.TestCase):
         self.assertEqual(process.exitcode, 0)
         self.assertFalse(fixture.tmp_path.exists())
 
+    def test_read_only_leftover_is_made_writable_and_removed_on_retry(self):
+        fixture = self._fixture()
+        fixture.open().seal("k", b"m")
+        # A genuinely read-only file sitting in the tree.
+        payload = fixture.tmp_path / "readonly.bin"
+        payload.write_bytes(b"read-only leftover")
+        payload.chmod(0o444)
+        self.assertEqual(payload.stat().st_mode & 0o222, 0)
+
+        # Force the first removal attempt to fail, so the teardown's
+        # recovery pass -- chmod every leftover writable, then delete the
+        # tree again -- is the path that actually runs.  The second call is
+        # the real remover working on the real read-only file.
+        real_rmtree = shutil.rmtree
+        removal_attempts: list[Path] = []
+
+        def fail_first_removal(path, *args, **kwargs):
+            removal_attempts.append(Path(path))
+            if len(removal_attempts) == 1:
+                raise OSError("simulated first-pass removal failure")
+            return real_rmtree(path, *args, **kwargs)
+
+        chmodded: list[tuple[str, int]] = []
+        real_chmod = os.chmod
+
+        def recording_chmod(path, mode, *args, **kwargs):
+            chmodded.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(
+            shutil, "rmtree", side_effect=fail_first_removal
+        ):
+            with mock.patch.object(os, "chmod", side_effect=recording_chmod):
+                fixture._cleanup()  # must not raise: the retry succeeds
+
+        # The recovery pass really did restore the read-only file to
+        # writable before deleting it again ...
+        self.assertIn((str(payload), 0o700), chmodded)
+        # ... and the removal really was retried once after the failure.
+        self.assertEqual(len(removal_attempts), 2)
+        self.assertEqual(removal_attempts[1], fixture.tmp_path)
+        # The retry deleted the whole tree: no debris and no read-only
+        # attribute left behind for later cases to trip over.
+        self.assertFalse(fixture.tmp_path.exists())
+
 
 def _wait_until(predicate, timeout: float, interval: float = 0.02) -> bool:
     deadline = time.monotonic() + timeout
@@ -336,7 +451,47 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         self.assertIn(str(fixture.tmp_path), message)
         # It says what could not be removed.
         self.assertIn("extra.txt", message)
+        # The handles came back cleanly, so no handle problem is reported:
+        # the removal failure stands on its own.
+        self.assertNotIn("not returned cleanly", message)
+        self.assertIsNone(caught.exception.__cause__)
         # The failure was not swallowed into nothingness.
+        self.assertTrue(fixture.tmp_path.exists())
+
+    def test_handle_failure_is_not_swallowed_by_removal_failure(self):
+        fixture = VaultFixture(unittest.TestCase())
+        self.addCleanup(
+            lambda: shutil.rmtree(fixture.tmp_path, ignore_errors=True)
+        )
+        vault = fixture.open()
+        vault.seal("k", b"m")
+        with mock.patch.object(
+            vault, "close", side_effect=RuntimeError("simulated close failure")
+        ):
+            with mock.patch.object(
+                shutil, "rmtree",
+                side_effect=OSError("simulated removal failure"),
+            ):
+                with self.assertRaises(AssertionError) as caught:
+                    fixture._cleanup()
+        message = str(caught.exception)
+        # The case fails and the directory problem is still named exactly ...
+        self.assertIn("teardown could not delete temporary directory", message)
+        self.assertIn(str(fixture.tmp_path), message)
+        # ... and the handle failure is surfaced alongside it, named in the
+        # message and chained as the direct cause -- not swallowed by the
+        # removal step.
+        self.assertIn("not returned cleanly", message)
+        self.assertIn("simulated close failure", message)
+        cause = caught.exception.__cause__
+        self.assertIsInstance(cause, RuntimeError)
+        self.assertEqual(str(cause), "simulated close failure")
+        # The simulated failure skipped the real handle return; the mocks
+        # are gone now, so close for real and leave no unclosed lock handle
+        # (which would surface as a ResourceWarning at interpreter shutdown).
+        vault.close()
+        # The directory genuinely survived; the safety-net cleanup above
+        # removes it for real after this case.
         self.assertTrue(fixture.tmp_path.exists())
 
     def test_close_handle_error_is_surfaced_not_swallowed(self):
@@ -398,6 +553,38 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         self.assertTrue(
             any("teardown could not delete" in tb for tb in tracebacks)
         )
+        for path in list(_SIMULATED_PATHS):
+            self.assertFalse(path.exists())
+
+    def test_original_assertion_stays_primary_when_handle_and_removal_fail(self):
+        _SIMULATED_PATHS.clear()
+        result = _run(
+            unittest.TestSuite([_SimAssertThenHandleAndCleanupFail("test_body")])
+        )
+
+        tracebacks = _tracebacks(result)
+        original = [
+            tb for tb in tracebacks if "ORIGINAL-ASSERTION-MARKER" in tb
+        ]
+        # The case's own assertion is still the primary failure, reported
+        # verbatim and not polluted by either teardown complaint.
+        self.assertEqual(len(original), 1)
+        self.assertIn("AssertionError", original[0])
+        self.assertIn(
+            'self.assertTrue(False, "ORIGINAL-ASSERTION-MARKER")', original[0]
+        )
+        self.assertIn("False is not true : ORIGINAL-ASSERTION-MARKER", original[0])
+        self.assertNotIn("teardown could not delete", original[0])
+        self.assertNotIn("SIMULATED-CLOSE-MARKER", original[0])
+        # The teardown surfaces BOTH of its failures together: the
+        # directory it could not delete and the handle it could not return.
+        combined = [
+            tb for tb in tracebacks if "teardown could not delete" in tb
+        ]
+        self.assertEqual(len(combined), 1)
+        self.assertIn("not returned cleanly", combined[0])
+        self.assertIn("SIMULATED-CLOSE-MARKER", combined[0])
+        self.assertIn("RuntimeError", combined[0])
         for path in list(_SIMULATED_PATHS):
             self.assertFalse(path.exists())
 
