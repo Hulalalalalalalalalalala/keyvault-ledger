@@ -11,7 +11,11 @@ cleanup runs, in one fixed order:
 3. drain the worker processes (terminating/killing anything still alive);
 4. return every vault lock handle via ``Vault.close`` — idempotent, safe to
    call on handles a case already closed;
-5. delete the whole temporary directory tree.
+5. delete the whole temporary directory tree.  This step never fails
+   silently: read-only leftovers get one writable retry, and if the
+   directory still survives that, teardown raises and names it, so the
+   case fails (the case's own assertion error, if any, is raised first and
+   stays on record verbatim).
 
 There is deliberately no second teardown route and no write-only handle
 registry: the tracked lists exist solely for this cleanup to read.
@@ -159,19 +163,48 @@ class VaultFixture:
                 pass
 
         # 5. Delete the whole temporary tree; every handle is back and every
-        #    worker gone, so the lock file cannot block removal.
+        #    worker gone, so the lock file cannot block removal.  A directory
+        #    that survives deletion is a teardown failure, not something to
+        #    quietly ignore: make read-only entries writable once and retry;
+        #    if it still exists afterwards, raise naming the directory that
+        #    could not be removed so the case fails for it.
         try:
             self._tmp.cleanup()
+            return
         except OSError:
-            # Read-only leftovers (some cases chmod files/dirs and restore
-            # them in their own cleanups): make the tree writable once and
-            # remove it outright, so nothing is ever left behind.
-            for base, dirs, files in os.walk(self.tmp_path, topdown=False):
-                for entry in files + dirs:
-                    try:
-                        os.chmod(os.path.join(base, entry), 0o700)
-                    except OSError:
-                        pass
-            shutil.rmtree(self.tmp_path, ignore_errors=True)
-            if self.tmp_path.exists():
-                raise
+            self._make_tree_writable(self.tmp_path)
+
+        try:
+            shutil.rmtree(self.tmp_path, ignore_errors=False)
+        except OSError as exc:
+            if not self.tmp_path.exists():
+                return
+            raise AssertionError(
+                f"could not remove temporary directory {self.tmp_path} "
+                f"during test teardown: {exc!r}"
+            ) from exc
+        if self.tmp_path.exists():
+            raise AssertionError(
+                "could not remove temporary directory "
+                f"{self.tmp_path} during test teardown"
+            )
+
+    @staticmethod
+    def _make_tree_writable(root: Path) -> None:
+        """Restore write/delete permission on every entry under ``root``.
+
+        Some cases chmod files or directories read-only and restore them in
+        their own cleanups; a failure before that restore would otherwise
+        leave the tree unremovable.  Directories also need execute (search)
+        permission to delete their contents.
+        """
+        for base, dirs, files in os.walk(root, topdown=False):
+            for entry in files + dirs:
+                try:
+                    os.chmod(os.path.join(base, entry), 0o700)
+                except OSError:
+                    pass
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            pass

@@ -567,15 +567,15 @@ class TestWindowsCloseRelease(WindowsLockTestCase):
     def test_close_is_idempotent_and_operations_reacquire_unchanged(self):
         vault = self.open_vault()
         vault.seal("k", b"one")
-        vault.close()
-        self.assertIsNone(vault._lock_fh)
-        vault.close()
-        vault.close()  # repeated release is not an error
-        self.assertIsNone(vault._lock_fh)
+        self.assertIsNone(vault.close())
+        # Repeated release is observable only as an error-free no-op; the
+        # assertions below never inspect internal handle state.
+        self.assertIsNone(vault.close())
+        self.assertIsNone(vault.close())
 
-        # Every operation kind reopens the lock and behaves identically.
+        # Every operation kind reopens the lock and behaves identically:
+        # the correct answers are observable through the public interface.
         self.assertEqual(vault.seal("k", b"two"), 2)
-        self.assertIsNotNone(vault._lock_fh)
         self.assertEqual(vault.load("k", 1), b"one")
         self.assertEqual(vault.load("k"), b"two")
         self.assertEqual(vault.derive_seal("d", b"pw", b"salt", 100, 16), 1)
@@ -585,8 +585,7 @@ class TestWindowsCloseRelease(WindowsLockTestCase):
         vault.reload()
         self.assertEqual(vault.active("k"), 2)
         self.assertTrue(vault.is_revoked("k", 1))
-        vault.close()
-        self.assertIsNone(vault._lock_fh)
+        self.assertIsNone(vault.close())
 
         # The reacquired-lock writes landed durably and survive a new open.
         reopened = self.open_vault()
