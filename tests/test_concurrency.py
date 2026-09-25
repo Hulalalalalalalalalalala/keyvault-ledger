@@ -354,8 +354,9 @@ def _cli_hammer(
     barrier: "multiprocessing.managers.Barrier",
 ) -> None:
     barrier.wait()
-    # The frozen output must not depend on the ambient warning policy (the
-    # CLI process owns a vault it never explicitly closes).
+    # The frozen output must not depend on the ambient warning policy: each
+    # CLI entry point explicitly returns its vault lock handle before exit, so
+    # even a strict policy appends no ResourceWarning tail line.
     env = cli_env()
     line_pattern = re.compile(r"^([^\t]+)\tactive=(\d+)\tversions=(\d+(?:,\d+)*)$")
     commands = []

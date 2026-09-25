@@ -32,6 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    vault: Vault | None = None
     try:
         vault = Vault(args.root)
         if args.command == "versions":
@@ -55,6 +56,16 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, TypeError, KeyError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # Return the lock file handle before the process exits instead of
+        # leaving it for interpreter shutdown to close (which surfaces as a
+        # ResourceWarning under strict warning policies).  close() is
+        # idempotent and the next operation would simply reacquire the lock,
+        # so observable behaviour and the frozen outputs/exit codes above are
+        # unchanged.  When opening the vault failed there is no handle to
+        # return (Vault.__init__ already released the one it briefly held).
+        if vault is not None:
+            vault.close()
     return 2  # unreachable: argparse enforces a known command
 
 

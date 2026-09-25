@@ -13,6 +13,16 @@ cleanup runs, in one fixed order:
    call on handles a case already closed;
 5. delete the whole temporary directory tree.
 
+Every step always runs: a failure draining a thread or process, returning a
+handle or removing the tree never causes a later step to be skipped.  Such
+failures are collected and reported truthfully at the end (raised from the
+cleanup as a single error or an ``ExceptionGroup``), never silently
+swallowed — unittest then shows them as a teardown ERROR in addition to, never
+instead of, the case's own assertion failure.  Temporary-directory removal is
+not allowed to ignore errors: anything left behind is reported.
+
+The whole cleanup is idempotent: a second call is a no-op and raises nothing.
+
 There is deliberately no second teardown route and no write-only handle
 registry: the tracked lists exist solely for this cleanup to read.
 """
@@ -21,7 +31,6 @@ from __future__ import annotations
 
 import multiprocessing
 import os
-import shutil
 import tempfile
 import threading
 import unittest
@@ -41,15 +50,16 @@ _PROCESS_JOIN_TIMEOUT = 30.0
 def cli_env() -> dict[str, str]:
     """Environment for a ``python -m keyvault_ledger`` subprocess.
 
-    The frozen CLI outputs must not depend on the ambient warning policy: the
-    CLI process owns a vault it never explicitly closes, so an inherited
-    ``PYTHONWARNINGS`` setting would append ``ResourceWarning`` tail lines to
-    its otherwise frozen stderr.  Every subprocess therefore gets the same
-    scrubbed environment.
+    The frozen CLI outputs do not depend on the ambient warning policy: every
+    entry point explicitly returns its vault lock handle before exit, so even a
+    strict policy that forces warnings on (``error`` plus
+    ``always::ResourceWarning``) appends no ``ResourceWarning`` tail line. The
+    ambient ``PYTHONWARNINGS`` is therefore left in place and propagates to
+    the subprocess, so a whole-suite run launched under the strictest policy
+    genuinely exercises the CLI under that policy.
     """
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env.pop("PYTHONWARNINGS", None)
     return env
 
 
@@ -67,6 +77,9 @@ class VaultFixture:
         self._processes: list[multiprocessing.Process] = []
         self._gates: list[object] = []
         self._barriers: list[object] = []
+        # Guards the single teardown: once cleanup has run, a repeat call is
+        # an error-free no-op.
+        self._cleaned_up = False
         # The one and only teardown registration for the whole case.
         test_case.addCleanup(self._cleanup)
 
@@ -104,8 +117,24 @@ class VaultFixture:
     # ------------------------------------------------------------------
 
     def _cleanup(self) -> None:
+        # One-shot teardown: a repeat call (a case finishing normally after it
+        # already ran cleanup explicitly, or unittest re-entering it) is an
+        # error-free no-op and never double-drains or double-closes.
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+
+        # Every meaningful step below is attempted even if an earlier step
+        # fails.  Failures are collected and raised together at the end rather
+        # than swallowed, so draining and handle return are reported
+        # truthfully while later steps still run.
+        errors: list[BaseException] = []
+
         # 1a. Let every blocked worker through: blocked writers only continue
         #     once the holder is released, and their results must not change.
+        #     A gate that cannot be set is tolerated here — the worker it was
+        #     meant to unblock then fails to drain in step 2/3, which is
+        #     reported.
         for gate in self._gates:
             try:
                 gate.set()
@@ -119,10 +148,18 @@ class VaultFixture:
                 pass
 
         # 2. Drain in-process threads before any handle they may use is
-        #    closed (close takes the vault's in-process lock).
+        #    closed (close takes the vault's in-process lock).  A thread that
+        #    is still alive after the bounded join is a real teardown failure.
         for thread in self._threads:
             if thread.is_alive():
                 thread.join(_THREAD_JOIN_TIMEOUT)
+                if thread.is_alive():
+                    errors.append(
+                        RuntimeError(
+                            f"worker thread did not drain within "
+                            f"{_THREAD_JOIN_TIMEOUT:g}s: {thread.name!r}"
+                        )
+                    )
 
         # 3. Drain worker processes; only escalate to kill if a graceful exit
         #    does not arrive.  Each worker closes its own vault on the way
@@ -134,18 +171,33 @@ class VaultFixture:
         for process in alive:
             try:
                 process.terminate()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(
+                    RuntimeError(
+                        f"could not terminate {process.name!r}: {exc!r}"
+                    )
+                )
             process.join(5)
         for process in [p for p in alive if p.is_alive()]:
             try:
                 process.kill()
-            except Exception:
-                pass
+            except Exception as exc:
+                errors.append(
+                    RuntimeError(f"could not kill {process.name!r}: {exc!r}")
+                )
             process.join(5)
+            if process.is_alive():
+                errors.append(
+                    RuntimeError(
+                        f"worker process did not exit: {process.name!r}"
+                    )
+                )
 
         # 4. Return every lock handle.  close() is idempotent by contract, so
-        #    handles a case closed itself are harmless no-ops.
+        #    handles a case closed itself are harmless no-ops; a close that
+        #    raises is reported rather than swallowed, but never skips the
+        #    remaining handles or the directory removal.  Calling close once
+        #    per distinct vault is enough: close() itself tolerates repeats.
         seen: set[int] = set()
         for vault in self._vaults:
             if id(vault) in seen:
@@ -153,25 +205,53 @@ class VaultFixture:
             seen.add(id(vault))
             try:
                 vault.close()
-                vault.close()  # repeated release must stay an error-free no-op
-            except Exception:
-                # Teardown must never mask the case's own exception.
-                pass
+            except Exception as exc:
+                errors.append(
+                    RuntimeError(
+                        f"returning a vault lock handle failed: {exc!r}"
+                    )
+                )
 
         # 5. Delete the whole temporary tree; every handle is back and every
-        #    worker gone, so the lock file cannot block removal.
+        #    worker gone, so the lock file cannot block removal.  Removal
+        #    failures are never silenced: anything that cannot be deleted is
+        #    made writable once and the TemporaryDirectory's own cleanup is
+        #    retried (rather than rmtree-ing behind its back, which would
+        #    leave its implicit finalizer to emit a ResourceWarning at exit).
+        #    A failure that survives that retry is reported, not ignored.
         try:
             self._tmp.cleanup()
-        except OSError:
+        except OSError as first_exc:
             # Read-only leftovers (some cases chmod files/dirs and restore
-            # them in their own cleanups): make the tree writable once and
-            # remove it outright, so nothing is ever left behind.
-            for base, dirs, files in os.walk(self.tmp_path, topdown=False):
-                for entry in files + dirs:
-                    try:
-                        os.chmod(os.path.join(base, entry), 0o700)
-                    except OSError:
-                        pass
-            shutil.rmtree(self.tmp_path, ignore_errors=True)
-            if self.tmp_path.exists():
-                raise
+            # them in their own cleanups): make the tree writable once.
+            self._make_tree_writable()
+            try:
+                # Retry through the object itself: on success it detaches its
+                # implicit finalizer, so no ResourceWarning tail line follows.
+                self._tmp.cleanup()
+            except OSError as retry_exc:
+                if self.tmp_path.exists():
+                    errors.append(
+                        RuntimeError(
+                            f"could not remove temporary directory "
+                            f"{self.tmp_path}: {retry_exc!r} "
+                            f"(first error: {first_exc!r})"
+                        )
+                    )
+
+        # Report all teardown failures together.  unittest records these as a
+        # cleanup ERROR in addition to the case's own assertion failure, never
+        # replacing it; with exactly one failure that error is re-raised.
+        if len(errors) == 1:
+            raise errors[0]
+        if len(errors) > 1:
+            raise ExceptionGroup("vault fixture teardown failed", errors)
+
+    def _make_tree_writable(self) -> None:
+        """Best-effort: make every path in the temp tree writable/removable."""
+        for base, dirs, files in os.walk(self.tmp_path, topdown=False):
+            for entry in files + dirs:
+                try:
+                    os.chmod(os.path.join(base, entry), 0o700)
+                except OSError:
+                    pass
