@@ -32,6 +32,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    vault: Vault | None = None
     try:
         vault = Vault(args.root)
         if args.command == "versions":
@@ -55,6 +56,12 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, TypeError, KeyError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        # Return the lock file handle before the process exits instead of
+        # leaving it for interpreter shutdown to close: repeated release is
+        # an error-free no-op and the next operation reacquires the lock.
+        if vault is not None:
+            vault.close()
     return 2  # unreachable: argparse enforces a known command
 
 

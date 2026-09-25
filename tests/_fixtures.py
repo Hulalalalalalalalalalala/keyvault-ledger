@@ -14,7 +14,16 @@ cleanup runs, in one fixed order:
 5. delete the whole temporary directory tree.
 
 There is deliberately no second teardown route and no write-only handle
-registry: the tracked lists exist solely for this cleanup to read.
+registry: the tracked lists exist solely for this cleanup to read.  No step
+is ever skipped silently: a gate that cannot be released, a thread or process
+that survives draining, a handle whose return raises, or a temporary tree
+that survives deletion is collected and reported (as one ``RuntimeError``
+raised once every step has run) rather than swallowed.  Reporting happens in
+addition to — never instead of — the case's own assertion failure, and a
+case that failed is still taken through every step so later cases run with
+all workers drained, all handles returned and all temporary space gone.
+Running the cleanup a second time (it is registered once, but cases may call
+it explicitly) is an error-free no-op.
 """
 
 from __future__ import annotations
@@ -41,15 +50,14 @@ _PROCESS_JOIN_TIMEOUT = 30.0
 def cli_env() -> dict[str, str]:
     """Environment for a ``python -m keyvault_ledger`` subprocess.
 
-    The frozen CLI outputs must not depend on the ambient warning policy: the
-    CLI process owns a vault it never explicitly closes, so an inherited
-    ``PYTHONWARNINGS`` setting would append ``ResourceWarning`` tail lines to
-    its otherwise frozen stderr.  Every subprocess therefore gets the same
-    scrubbed environment.
+    The frozen CLI outputs must stay byte-for-byte stable, and every entry
+    point now returns its vault lock handle before exiting, so the ambient
+    warning policy is inherited verbatim: under a forced-visible strict
+    policy a CLI process must finish on its ordinary ending line with no
+    ``ResourceWarning`` tail whatsoever.
     """
     env = dict(os.environ)
     env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
-    env.pop("PYTHONWARNINGS", None)
     return env
 
 
@@ -68,6 +76,7 @@ class VaultFixture:
         self._gates: list[object] = []
         self._barriers: list[object] = []
         # The one and only teardown registration for the whole case.
+        self._cleaned = False
         test_case.addCleanup(self._cleanup)
 
     def path(self, name: str) -> Path:
@@ -104,25 +113,44 @@ class VaultFixture:
     # ------------------------------------------------------------------
 
     def _cleanup(self) -> None:
+        # A second call is an error-free no-op: a finished run has nothing
+        # left to drain, return or delete.
+        if self._cleaned:
+            return
+        self._cleaned = True
+        problems: list[str] = []
+
         # 1a. Let every blocked worker through: blocked writers only continue
         #     once the holder is released, and their results must not change.
-        for gate in self._gates:
+        for index, gate in enumerate(self._gates):
             try:
                 gate.set()
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append(
+                    f"gate {index} could not be released: {exc!r}"
+                )
         # 1b. Break barriers so nobody waits for parties that never arrive.
-        for barrier in self._barriers:
+        for index, barrier in enumerate(self._barriers):
             try:
                 barrier.abort()
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append(
+                    f"barrier {index} could not be aborted: {exc!r}"
+                )
 
         # 2. Drain in-process threads before any handle they may use is
-        #    closed (close takes the vault's in-process lock).
+        #    closed (close takes the vault's in-process lock).  A thread that
+        #    survives the bound is reported, never silently left running.
+        stuck_threads: list[str] = []
         for thread in self._threads:
             if thread.is_alive():
                 thread.join(_THREAD_JOIN_TIMEOUT)
+                if thread.is_alive():
+                    stuck_threads.append(thread.name)
+        if stuck_threads:
+            problems.append(
+                "threads still alive after drain: " + ", ".join(stuck_threads)
+            )
 
         # 3. Drain worker processes; only escalate to kill if a graceful exit
         #    does not arrive.  Each worker closes its own vault on the way
@@ -134,32 +162,45 @@ class VaultFixture:
         for process in alive:
             try:
                 process.terminate()
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append(
+                    f"process {process.name} could not terminate: {exc!r}"
+                )
             process.join(5)
         for process in [p for p in alive if p.is_alive()]:
             try:
                 process.kill()
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append(
+                    f"process {process.name} could not be killed: {exc!r}"
+                )
             process.join(5)
+        still_alive = [process.name for process in alive if process.is_alive()]
+        if still_alive:
+            problems.append(
+                "processes still alive after drain: " + ", ".join(still_alive)
+            )
 
         # 4. Return every lock handle.  close() is idempotent by contract, so
-        #    handles a case closed itself are harmless no-ops.
+        #    handles a case closed itself are harmless no-ops; each is closed
+        #    twice to pin that repeated release never reports an error.
         seen: set[int] = set()
-        for vault in self._vaults:
+        for index, vault in enumerate(self._vaults):
             if id(vault) in seen:
                 continue
             seen.add(id(vault))
             try:
                 vault.close()
-                vault.close()  # repeated release must stay an error-free no-op
-            except Exception:
-                # Teardown must never mask the case's own exception.
-                pass
+                vault.close()
+            except Exception as exc:
+                problems.append(
+                    f"vault {index} lock handle return failed: {exc!r}"
+                )
 
         # 5. Delete the whole temporary tree; every handle is back and every
-        #    worker gone, so the lock file cannot block removal.
+        #    worker gone, so the lock file cannot block removal.  Failure is
+        #    reported, not skipped: make the tree writable once, retry, then
+        #    flag anything that still survives.
         try:
             self._tmp.cleanup()
         except OSError:
@@ -172,6 +213,20 @@ class VaultFixture:
                         os.chmod(os.path.join(base, entry), 0o700)
                     except OSError:
                         pass
-            shutil.rmtree(self.tmp_path, ignore_errors=True)
-            if self.tmp_path.exists():
-                raise
+            try:
+                if self.tmp_path.exists():
+                    shutil.rmtree(self.tmp_path)
+            except OSError as exc:
+                problems.append(f"temporary tree removal failed: {exc!r}")
+        if self.tmp_path.exists():
+            problems.append(
+                f"temporary directory survived cleanup: {self.tmp_path}"
+            )
+
+        if problems:
+            # unittest chains a cleanup failure onto the case's own result,
+            # so this report never masks or rewrites the assertion the case
+            # actually failed with: both surface verbatim.
+            raise RuntimeError(
+                "fixture teardown problems:\n  - " + "\n  - ".join(problems)
+            )
