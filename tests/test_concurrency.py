@@ -35,7 +35,6 @@ import queue as queue_mod
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -49,6 +48,8 @@ from keyvault_ledger.vault import (
     MATERIALS_DIR,
     REVOCATIONS_NAME,
 )
+
+from tests.vaultcase import VaultFixtureCase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -453,24 +454,11 @@ def _close_dance_b(
 # ---------------------------------------------------------------------------
 
 
-class ConcurrencyTestCase(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name) / "vault"
-        self._opened_vaults: list[Vault] = []
-
-    def open_vault(self) -> Vault:
-        vault = Vault(self.root)
-        # Registered after the temp-dir cleanup, so LIFO ordering releases
-        # every lock handle before the temporary directory is removed.
-        self.addCleanup(self._close_vault, vault)
-        self._opened_vaults.append(vault)
-        return vault
-
-    @staticmethod
-    def _close_vault(vault: Vault) -> None:
-        vault.close()
+class ConcurrencyTestCase(VaultFixtureCase):
+    # The temporary directory, its single teardown exit (drain registered
+    # threads, return handles, remove the directory) and ``open_vault`` all
+    # come from the shared fixture; this base adds only disk-state helpers
+    # and process orchestration.
 
     def disk_manifest(self) -> dict:
         return json.loads((self.root / MANIFEST_NAME).read_bytes().decode("utf-8"))
@@ -1091,8 +1079,12 @@ class TestThreadedInterleaving(ConcurrencyTestCase):
         threads = [
             threading.Thread(target=seal_phase, args=(t,)) for t in range(thread_count)
         ]
+        # Drain through the single teardown too: a failed assertion still
+        # waits for these threads (and the in-thread handles they close
+        # themselves) before any case handle is returned.
         for thread in threads:
             thread.start()
+            self.watch_thread(thread)
         for thread in threads:
             thread.join(timeout=30)
             self.assertFalse(thread.is_alive())
@@ -1179,8 +1171,15 @@ class TestThreadedInterleaving(ConcurrencyTestCase):
             threading.Thread(target=repoint),
             threading.Thread(target=reader),
         ]
+        # Register everything before the first join, so a failed assertion
+        # midway still drains it: the reader only exits once
+        # ``sealers_done`` is set, hence its gate; the other workers finish
+        # on their own.
         for worker in workers:
             worker.start()
+        for worker in workers[:-1]:
+            self.watch_thread(worker)
+        self.watch_thread(workers[-1], sealers_done)
         for worker in workers[:-1]:
             worker.join(timeout=30)
             self.assertFalse(worker.is_alive())

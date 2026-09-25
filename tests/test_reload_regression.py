@@ -42,7 +42,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -55,6 +54,8 @@ from keyvault_ledger.vault import (
     _dump_manifest,
 )
 
+from tests.vaultcase import VaultFixtureCase
+
 PLAIN_MATERIALS = {1: b"plain-one", 2: b"plain-two"}
 DRV_PARAMETERS = {
     1: (b"passphrase-alpha", b"salt-alpha", 1000, 32),
@@ -64,23 +65,15 @@ MIX_DERIVED = (b"passphrase-charlie", b"salt-charlie", 500, 24)
 MIX_PLAIN = {1: b"mix-one", 3: b"mix-three"}
 
 
-class ReloadRegressionTestCase(unittest.TestCase):
+class ReloadRegressionTestCase(VaultFixtureCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
+        super().setUp()
         # Each corruption scenario gets its own vault subdirectory, so cases
         # never share disk state and execution order cannot matter.
         self.root = Path(self._tmp.name) / "vaults"
-        self._handles: list[Vault] = []
 
     def _open(self, root: Path) -> Vault:
-        vault = Vault(root)
-        self._handles.append(vault)
-        return vault
-
-    def tearDown(self) -> None:
-        for vault in self._handles:
-            vault.close()
+        return self.open_vault(root)
 
     # ------------------------------------------------------------------
     # fixture construction

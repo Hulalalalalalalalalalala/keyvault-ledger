@@ -12,7 +12,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import types
 import unittest
@@ -30,6 +29,8 @@ from keyvault_ledger.vault import (
     _derive_material,
     _dump_manifest,
 )
+
+from tests.vaultcase import VaultFixtureCase
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -72,25 +73,9 @@ def _set_active_worker(root: str, key_id: str, versions: list[int]) -> None:
         vault.close()
 
 
-class VaultTestCase(unittest.TestCase):
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name) / "vault"
-
-    def open_vault(self) -> Vault:
-        """Open a vault and guarantee its lock handle is returned.
-
-        The ``close`` cleanup is registered *after* the temporary-directory
-        cleanup, so LIFO ordering releases every lock handle before the
-        temporary directory is removed.  Cleanups run even when a test fails
-        or raises, so a vault opened mid-case is closed the same way; the
-        original assertion/exception still propagates verbatim.  ``close``
-        is idempotent, so cases that close their vault themselves are fine.
-        """
-        vault = Vault(self.root)
-        self.addCleanup(vault.close)
-        return vault
+class VaultTestCase(VaultFixtureCase):
+    # The temporary directory, the single teardown exit and open_vault come
+    # from the shared fixture; this base adds only disk-state helpers.
 
     def manifest_path(self) -> Path:
         return self.root / MANIFEST_NAME
@@ -998,10 +983,15 @@ class TestSealCleanup(VaultTestCase):
         ):
             reloader = threading.Thread(target=vault.reload)
             reloader.start()
+            # Registered with its gate before any wait/assertion: a failure
+            # while it parks on ``release_read`` still lets it through and
+            # drains it (it owns the vault's in-process lock until done).
+            self.watch_thread(reloader, release_read)
             self.assertTrue(read_started.wait(timeout=5))
 
             sealer = threading.Thread(target=do_seal)
             sealer.start()
+            self.watch_thread(sealer)
             # The reload holds the lock for the whole read, so the seal
             # cannot complete until the read finishes: it is blocked and
             # the on-disk manifest is still the v1 one.
@@ -1473,11 +1463,11 @@ class TestDerivationReloadValidation(VaultTestCase):
 
     def _fresh_vault(self) -> tuple[Vault, Path]:
         root = Path(self._tmp.name) / f"case-{next(self._counter)}"
-        vault = Vault(root)
-        # Registered after the temporary-directory cleanup (setUp), so the
-        # LIFO order releases this handle before the shared temp dir is
-        # removed; a failed assertion in the subTest still releases it.
-        self.addCleanup(vault.close)
+        # Goes through the single teardown (this sub-vault is a sibling of
+        # the case's main vault inside the same temporary directory); a
+        # failed assertion in the subTest still returns this handle before
+        # the directory is removed.
+        vault = self.open_vault(root)
         return vault, root
 
     def setUp(self) -> None:
@@ -1647,10 +1637,10 @@ class TestWindowsLockFallback(VaultTestCase):
         fake, state = self._fake_msvcrt()
         with mock.patch.object(vault_mod, "fcntl", None):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
-                vault = Vault(self.root)
-                # Released again at cleanup (idempotent) if an assertion above
-                # fails before the explicit close inside this block.
-                self.addCleanup(vault.close)
+                # Routed through the single teardown, which closes the
+                # handle after leaving the mock context: close() only shuts
+                # file handles and is harmless there.
+                vault = self.open_vault()
                 self.assertEqual(vault.seal("k", b"m"), 1)
                 vault.derive_seal("k", b"pw", b"salt", 10, 8)
                 vault.seal("k", b"m2")
@@ -1671,9 +1661,10 @@ class TestWindowsLockFallback(VaultTestCase):
         with mock.patch.object(vault_mod, "fcntl", None):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
                 # Both handles exist before anyone holds the lock, so their
-                # construction never contends.
-                holder_vault = Vault(self.root)
-                waiter = Vault(self.root)
+                # construction never contends.  They go through the single
+                # teardown like every other handle.
+                holder_vault = self.open_vault()
+                waiter = self.open_vault()
                 holder_vault.seal("k", b"seed")
 
                 holder_ready = threading.Event()
@@ -1697,28 +1688,8 @@ class TestWindowsLockFallback(VaultTestCase):
 
                 holder = threading.Thread(target=hold)
                 holder.start()
-
-                def _close_test_vaults() -> None:
-                    # Runs last (LIFO), after both threads are joined below;
-                    # close() only shuts file handles, so it is safe outside
-                    # the mock-patch context too and harmless when repeated.
-                    holder_vault.close()
-                    waiter.close()
-
-                def _join_holder_thread() -> None:
-                    # Release and join the holder before closing its vault:
-                    # close() takes the vault's in-process RLock, which the
-                    # holder thread still owns while parked on the event, so
-                    # closing first would deadlock if an assertion failed
-                    # before the normal join below.
-                    release_holder.set()
-                    holder.join(timeout=5)
-
-                # Registered first so LIFO ordering runs it last; the two
-                # thread-join cleanups registered afterwards drain the
-                # threads before any handle is closed.
-                self.addCleanup(_close_test_vaults)
-                self.addCleanup(_join_holder_thread)
+                # Registered with its gate before any wait/assertion.
+                self.watch_thread(holder, release_holder)
                 self.assertTrue(holder_ready.wait(timeout=5))
 
                 seal_done = threading.Event()
@@ -1732,15 +1703,13 @@ class TestWindowsLockFallback(VaultTestCase):
 
                 sealer = threading.Thread(target=do_seal)
                 sealer.start()
+                # The single teardown releases the holder (the gate) and
+                # joins both threads before either handle is returned;
+                # close() takes the vault's RLock, which the holder owns
+                # while parked, so draining it first is required if an
+                # assertion fails below.
+                self.watch_thread(sealer)
 
-                def _join_sealer_thread() -> None:
-                    # If an assertion failed while the sealer was blocked on
-                    # the holder, release it and wait for the seal to finish
-                    # so the thread cannot race the handle-closing cleanup.
-                    release_holder.set()
-                    sealer.join(timeout=5)
-
-                self.addCleanup(_join_sealer_thread)
                 # Holder keeps the lock well past the first 0.05s retry, so
                 # the sealer is guaranteed blocked, having seen contention.
                 sealer.join(timeout=1.0)

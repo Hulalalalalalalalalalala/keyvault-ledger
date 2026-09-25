@@ -48,7 +48,6 @@ import multiprocessing
 import os
 import queue as queue_mod
 import sys
-import tempfile
 import time
 import types
 import unittest
@@ -65,6 +64,8 @@ from keyvault_ledger.vault import (
     REVOCATIONS_NAME,
     _dump_manifest,
 )
+
+from tests.vaultcase import VaultFixtureCase
 
 try:
     import fcntl as _os_fcntl
@@ -274,11 +275,9 @@ def _win_close_dance_b(
 @unittest.skipUnless(
     _MSVCRT_STAND_IN is not None, "no OS mutex available for the Windows branch"
 )
-class WindowsLockTestCase(unittest.TestCase):
+class WindowsLockTestCase(VaultFixtureCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name) / "vault"
+        super().setUp()
         # The whole test — parent side included — runs on the Windows
         # branch; both patches are reverted at teardown so no other test
         # module is affected regardless of execution order.  The
@@ -301,13 +300,11 @@ class WindowsLockTestCase(unittest.TestCase):
                 sys.modules["msvcrt"] = previous_msvcrt
 
         self.addCleanup(restore_msvcrt)
-
-    def open_vault(self) -> Vault:
-        vault = Vault(self.root)
-        # Registered after the temp-dir cleanup, so LIFO ordering releases
-        # every lock handle before the temporary directory is removed.
-        self.addCleanup(vault.close)
-        return vault
+        # The two patch restores above run before the shared single
+        # teardown (LIFO): it only joins processes-free threads, returns
+        # handles (close() merely shuts file handles, so it is safe and
+        # idempotent outside the mock context) and then removes the
+        # directory.
 
     def disk_manifest(self) -> dict:
         return json.loads((self.root / MANIFEST_NAME).read_bytes().decode("utf-8"))
