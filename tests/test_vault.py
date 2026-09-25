@@ -36,38 +36,65 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _seal_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
     vault = Vault(root)
-    for payload in payloads:
-        vault.seal(key_id, payload)
+    try:
+        for payload in payloads:
+            vault.seal(key_id, payload)
+    finally:
+        vault.close()
 
 
 def _reload_worker(root: str, count: int) -> None:
     vault = Vault(root)
-    for _ in range(count):
-        vault.reload()
+    try:
+        for _ in range(count):
+            vault.reload()
+    finally:
+        vault.close()
 
 
 def _revoke_worker(root: str, key_id: str, versions: list[int]) -> None:
     vault = Vault(root)
-    for version in versions:
-        vault.revoke(key_id, version)
-        vault.reload()
+    try:
+        for version in versions:
+            vault.revoke(key_id, version)
+            vault.reload()
+    finally:
+        vault.close()
 
 
 def _set_active_worker(root: str, key_id: str, versions: list[int]) -> None:
     vault = Vault(root)
-    for version in versions:
-        vault.set_active(key_id, version)
-        vault.reload()
+    try:
+        for version in versions:
+            vault.set_active(key_id, version)
+            vault.reload()
+    finally:
+        vault.close()
 
 
 class VaultTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
+        # Registered first, so it runs last: every lock handle opened via
+        # ``open_vault`` is released before the temporary directory is
+        # removed.  Cleanups run even when the test fails mid-way, so an
+        # assertion never strands a handle or a non-empty temp directory.
         self.addCleanup(self._tmp.cleanup)
         self.root = Path(self._tmp.name) / "vault"
+        self._opened_vaults: list[Vault] = []
 
-    def open_vault(self) -> Vault:
-        return Vault(self.root)
+    def open_vault(self, root: Path | str | None = None) -> Vault:
+        vault = Vault(self.root if root is None else root)
+        self._opened_vaults.append(vault)
+        # Each release is its own cleanup, registered after the temp-dir
+        # cleanup, so LIFO ordering hands every handle back before the
+        # directory tree is deleted.  ``close`` is idempotent.
+        self.addCleanup(self._close_vault, vault)
+        return vault
+
+    @staticmethod
+    def _close_vault(vault: Vault) -> None:
+        vault.close()
 
     def manifest_path(self) -> Path:
         return self.root / MANIFEST_NAME
@@ -865,7 +892,7 @@ class TestActivationJournalValidation(VaultTestCase):
         self._write_activations(self._record(version=1, latest=2))
         vault.reload()
         self.assertEqual(vault.active("k"), 3)
-        self.assertEqual(Vault(self.root).active("k"), 3)
+        self.assertEqual(self.open_vault().active("k"), 3)
 
     def test_only_last_record_for_a_key_applies(self):
         vault = self.open_vault()
@@ -1237,8 +1264,11 @@ class TestMultiProcess(VaultTestCase):
 def _derive_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
     vault = Vault(root)
     salt = b"worker-salt"
-    for i, payload in enumerate(payloads):
-        vault.derive_seal(key_id, payload, salt, 100, 16)
+    try:
+        for i, payload in enumerate(payloads):
+            vault.derive_seal(key_id, payload, salt, 100, 16)
+    finally:
+        vault.close()
 
 
 class TestDeriveSeal(VaultTestCase):
@@ -1447,7 +1477,7 @@ class TestDerivationReloadValidation(VaultTestCase):
 
     def _fresh_vault(self) -> tuple[Vault, Path]:
         root = Path(self._tmp.name) / f"case-{next(self._counter)}"
-        return Vault(root), root
+        return self.open_vault(root), root
 
     def setUp(self) -> None:
         super().setUp()
@@ -1616,7 +1646,7 @@ class TestWindowsLockFallback(VaultTestCase):
         fake, state = self._fake_msvcrt()
         with mock.patch.object(vault_mod, "fcntl", None):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
-                vault = Vault(self.root)
+                vault = self.open_vault()
                 self.assertEqual(vault.seal("k", b"m"), 1)
                 vault.derive_seal("k", b"pw", b"salt", 10, 8)
                 vault.seal("k", b"m2")
@@ -1626,7 +1656,7 @@ class TestWindowsLockFallback(VaultTestCase):
                 self.assertEqual(vault.active("k"), 1)
                 self.assertEqual(state["held"], {})
                 vault.close()
-        self.assertEqual(Vault(self.root).load("k", 1), b"m")
+        self.assertEqual(self.open_vault().load("k", 1), b"m")
 
     def test_fallback_retries_until_lock_is_released(self):
         import keyvault_ledger.vault as vault_mod
@@ -1636,8 +1666,8 @@ class TestWindowsLockFallback(VaultTestCase):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
                 # Both handles exist before anyone holds the lock, so their
                 # construction never contends.
-                holder_vault = Vault(self.root)
-                waiter = Vault(self.root)
+                holder_vault = self.open_vault()
+                waiter = self.open_vault()
                 holder_vault.seal("k", b"seed")
 
                 holder_ready = threading.Event()
