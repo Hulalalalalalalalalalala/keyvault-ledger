@@ -16,8 +16,12 @@ this module pins the *test-side* cleanup contract only:
 * when returning a lock handle and deleting the tree both fail, the handle
   failure is surfaced together with the removal failure -- named in the
   message and chained as its cause -- instead of being swallowed by it;
-  a handle failure with a healthy removal is reported on its own, and a
-  removal failure with healthy handles names only the directory;
+  this stays true when the tree is cleared by a racing remover between the
+  failed retry and the final survival probe: with no directory left to
+  name, the removal error itself is raised with the handle error chained
+  as its direct cause, so neither failure is dropped or rewritten into the
+  other; a handle failure with a healthy removal is reported on its own,
+  and a removal failure with healthy handles names only the directory;
 
 * a read-only leftover that blocks the first removal attempt is made
   writable and the removal retried; a successful retry ends the case
@@ -194,6 +198,96 @@ def _force_handle_and_removal_failure(
     return fixture, vault
 
 
+def _force_handle_and_removal_failure_tree_cleared(
+    test_case: unittest.TestCase,
+) -> tuple[VaultFixture, Vault]:
+    """Give ``test_case`` a fixture whose handle return fails, whose *both*
+    tree-removal attempts fail, and whose tree is nevertheless cleared --
+    by a racing remover -- between the failed retry and the final survival
+    probe.
+
+    That is the only way to reach the ``raise removal_error from
+    handle_error`` exit of the single cleanup: the tree is gone by the time
+    the survival probe runs, so there is no directory left to name, yet the
+    two steps really did fail and both failures must survive -- the raw
+    removal error raised with the handle error chained as its direct cause.
+
+    Same recovery contract as :func:`_force_handle_and_removal_failure`:
+    the recovery cleanup is registered before the fixture cleanup, so LIFO
+    ordering runs the (doubly failing) fixture cleanup first -- while all
+    patches are still in place -- and only then restores the real close,
+    the real remover and the real existence probe, returns the handle for
+    real and deletes whatever remains, so no directory and no unclosed lock
+    handle is left behind.  The patches are installed with ``start()``
+    rather than ``with`` so they are still active when the fixture cleanup
+    runs (a ``with`` block would unwind them on the body's assertion before
+    the single cleanup ever sees them).
+    """
+    real_rmtree = shutil.rmtree
+    real_exists = Path.exists
+    holder: dict = {}
+    state = {"removal_attempts": 0, "survival_probes": 0}
+
+    def fail_removal(path, *args, **kwargs):
+        # Only the case's own tree fails; every other removal (including the
+        # racing remover deleting the tree for real) goes through untouched.
+        if str(path) == str(holder["fixture"].tmp_path):
+            state["removal_attempts"] += 1
+            raise OSError("simulated removal failure")
+        return real_rmtree(path, *args, **kwargs)
+
+    def racing_exists(path, *args, **kwargs):
+        fixture = holder["fixture"]
+        if (
+            str(path) == str(fixture.tmp_path)
+            and state["removal_attempts"] >= 2
+        ):
+            # The first post-retry probe is the one inside the except arm
+            # deciding whether to keep the retry error; it must still see
+            # the tree.  The second is the final survival probe, at which
+            # point the "racing remover" deletes the tree for real and
+            # reports it gone.
+            state["survival_probes"] += 1
+            if state["survival_probes"] == 2:
+                real_rmtree(fixture.tmp_path)
+                return False
+        return real_exists(path, *args, **kwargs)
+
+    rmtree_patcher = mock.patch.object(
+        shutil, "rmtree", side_effect=fail_removal
+    )
+    exists_patcher = mock.patch.object(
+        Path, "exists", autospec=True, side_effect=racing_exists
+    )
+    close_patcher_holder: list = []
+
+    def recover() -> None:
+        rmtree_patcher.stop()
+        exists_patcher.stop()
+        for close_patcher in close_patcher_holder:
+            close_patcher.stop()
+        # The simulated failures skipped the real handle return; do it for
+        # real now so no unclosed lock handle survives to shutdown.
+        holder["vault"].close()
+        real_rmtree(holder["fixture"].tmp_path, ignore_errors=True)
+
+    test_case.addCleanup(recover)
+    fixture = VaultFixture(test_case)
+    vault = fixture.open()
+    holder["fixture"] = fixture
+    holder["vault"] = vault
+    vault.seal("k", b"m")
+    _SIMULATED_PATHS.append(fixture.tmp_path)
+    close_patcher = mock.patch.object(
+        vault, "close", side_effect=RuntimeError("SIMULATED-CLOSE-MARKER")
+    )
+    close_patcher_holder.append(close_patcher)
+    close_patcher.start()
+    rmtree_patcher.start()
+    exists_patcher.start()
+    return fixture, vault
+
+
 class _SimAssertThenCleanupFail(unittest.TestCase):
     """The case fails an assertion and its directory removal fails too."""
 
@@ -220,6 +314,20 @@ class _SimAssertThenHandleAndCleanupFail(unittest.TestCase):
 
     def test_body(self) -> None:
         _fixture, vault = _force_handle_and_removal_failure(self)
+        vault.seal("k", b"m")
+        self.assertTrue(False, "ORIGINAL-ASSERTION-MARKER")
+
+
+class _SimAssertThenHandleAndRemovalFailTreeCleared(unittest.TestCase):
+    """The case fails an assertion; teardown then fails to return the lock
+    handle AND fails both tree-removal attempts, but the tree is cleared by
+    a racing remover before the final survival probe.  The original
+    assertion must stay the verbatim primary failure, while the teardown
+    still surfaces the removal error with the handle error chained as its
+    direct cause -- neither of the two swallowed or rewritten."""
+
+    def test_body(self) -> None:
+        _fixture, vault = _force_handle_and_removal_failure_tree_cleared(self)
         vault.seal("k", b"m")
         self.assertTrue(False, "ORIGINAL-ASSERTION-MARKER")
 
@@ -494,6 +602,80 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         # removes it for real after this case.
         self.assertTrue(fixture.tmp_path.exists())
 
+    def test_both_errors_survive_when_racing_remover_clears_the_tree(self):
+        # The other double-failure exit: both removal attempts fail AND the
+        # handle cannot be returned, but a racing remover clears the tree
+        # between the failed retry and the final survival probe.  With no
+        # directory left to name there is no AssertionError message to
+        # build; the raw removal error must still be raised, with the handle
+        # error chained as its direct cause -- neither dropped nor rewritten
+        # into the other.
+        fixture = VaultFixture(unittest.TestCase())
+        self.addCleanup(
+            lambda: shutil.rmtree(fixture.tmp_path, ignore_errors=True)
+        )
+        vault = fixture.open()
+        vault.seal("k", b"m")
+
+        real_rmtree = shutil.rmtree
+        real_exists = Path.exists
+        attempts: list[Path] = []
+        probes: list[Path] = []
+
+        def fail_removal(path, *args, **kwargs):
+            # Only the case's own tree ever fails; the racing remover's
+            # real deletion (and every other removal) passes straight
+            # through to the real remover.
+            if Path(path) == fixture.tmp_path:
+                attempts.append(Path(path))
+                raise OSError("simulated removal failure")
+            return real_rmtree(path, *args, **kwargs)
+
+        def racing_remover(path, *args, **kwargs):
+            if Path(path) == fixture.tmp_path and len(attempts) >= 2:
+                probes.append(Path(path))
+                if len(probes) == 2:
+                    # The final survival probe: a racing remover has just
+                    # finished the tree the two failed attempts could not.
+                    real_rmtree(fixture.tmp_path)
+                    return False
+            return real_exists(path, *args, **kwargs)
+
+        with mock.patch.object(shutil, "rmtree", side_effect=fail_removal):
+            with mock.patch.object(
+                Path, "exists", autospec=True, side_effect=racing_remover
+            ):
+                with mock.patch.object(
+                    vault,
+                    "close",
+                    side_effect=RuntimeError("simulated close failure"),
+                ):
+                    with self.assertRaises(OSError) as caught:
+                        fixture._cleanup()
+
+        # The removal failure is raised verbatim -- not rewritten into a
+        # directory-naming assertion, since the directory is already gone --
+        # and the handle failure is chained as its explicit direct cause:
+        # both steps' errors are presented in full.
+        self.assertEqual(str(caught.exception), "simulated removal failure")
+        cause = caught.exception.__cause__
+        self.assertIsInstance(cause, RuntimeError)
+        self.assertEqual(str(cause), "simulated close failure")
+        # The explicit ``raise removal_error from handle_error`` chain (not
+        # an accidental "during handling" context), so the handle error is
+        # presented as the direct cause of the removal error.
+        self.assertTrue(caught.exception.__suppress_context__)
+        # Both removal attempts genuinely ran: the first pass and the
+        # read-only recovery retry, both against the case's own tree.
+        self.assertEqual(attempts, [fixture.tmp_path, fixture.tmp_path])
+        self.assertEqual(probes, [fixture.tmp_path, fixture.tmp_path])
+        # The racing remover really did clear the tree.
+        self.assertFalse(fixture.tmp_path.exists())
+        # The simulated failure skipped the real handle return; close for
+        # real now (the handle outlives its unlinked tree on POSIX) so no
+        # unclosed lock file handle survives to interpreter shutdown.
+        vault.close()
+
     def test_close_handle_error_is_surfaced_not_swallowed(self):
         fixture = VaultFixture(unittest.TestCase())
         self.addCleanup(
@@ -585,6 +767,61 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         self.assertIn("not returned cleanly", combined[0])
         self.assertIn("SIMULATED-CLOSE-MARKER", combined[0])
         self.assertIn("RuntimeError", combined[0])
+        for path in list(_SIMULATED_PATHS):
+            self.assertFalse(path.exists())
+
+    def test_original_assertion_stays_primary_when_tree_cleared_race(self):
+        # The same double failure, but with the tree cleared by a racing
+        # remover before the final survival probe.  The single cleanup then
+        # has no directory to name: it raises the raw removal error with
+        # the handle error chained as its direct cause.  unittest records
+        # the body's assertion separately -- still the verbatim primary
+        # failure -- and reports the chained teardown pair as its own error:
+        # the assertion is neither swallowed nor rewritten, and neither
+        # teardown error loses the other.
+        _SIMULATED_PATHS.clear()
+        result = _run(
+            unittest.TestSuite(
+                [_SimAssertThenHandleAndRemovalFailTreeCleared("test_body")]
+            )
+        )
+
+        tracebacks = _tracebacks(result)
+        original = [
+            tb for tb in tracebacks if "ORIGINAL-ASSERTION-MARKER" in tb
+        ]
+        # The case's own assertion is still the primary failure, reported
+        # verbatim and not polluted by either teardown complaint.
+        self.assertEqual(len(original), 1)
+        self.assertIn("AssertionError", original[0])
+        self.assertIn(
+            'self.assertTrue(False, "ORIGINAL-ASSERTION-MARKER")', original[0]
+        )
+        self.assertIn("False is not true : ORIGINAL-ASSERTION-MARKER", original[0])
+        self.assertNotIn("teardown could not delete", original[0])
+        self.assertNotIn("SIMULATED-CLOSE-MARKER", original[0])
+        # The teardown presents BOTH failures together in one error: the
+        # removal error raised at the single exit, and the handle error
+        # chained as its direct cause.
+        combined = [tb for tb in tracebacks if "SIMULATED-CLOSE-MARKER" in tb]
+        self.assertEqual(len(combined), 1)
+        self.assertIn("OSError: simulated removal failure", combined[0])
+        self.assertIn("RuntimeError: SIMULATED-CLOSE-MARKER", combined[0])
+        self.assertIn(
+            "The above exception was the direct cause of the following "
+            "exception",
+            combined[0],
+        )
+        # The removal traceback points at the single cleanup exit, not at a
+        # second cleanup path bolted on for this branch.
+        self.assertIn(
+            "tests/_fixtures.py", combined[0]
+        )
+        self.assertNotIn("teardown could not delete", combined[0])
+        # The body failure is a failure; the chained teardown pair is an
+        # error.  They stay distinct, one never replacing the other.
+        self.assertEqual(len(result.failures), 1)
+        self.assertEqual(len(result.errors), 1)
         for path in list(_SIMULATED_PATHS):
             self.assertFalse(path.exists())
 
