@@ -32,6 +32,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    # A vault whose constructor raised already released its own lock handle;
+    # only a successfully opened one is returned below.  The finally runs on
+    # both the success returns and the error return, so every subcommand
+    # gives the handle back however it exits.  close() is idempotent and
+    # never suppresses an error.
+    vault: Vault | None = None
     try:
         vault = Vault(args.root)
         if args.command == "versions":
@@ -55,6 +61,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, TypeError, KeyError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if vault is not None:
+            vault.close()
     return 2  # unreachable: argparse enforces a known command
 
 

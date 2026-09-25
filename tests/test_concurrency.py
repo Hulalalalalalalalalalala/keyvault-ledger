@@ -355,7 +355,7 @@ def _cli_hammer(
 ) -> None:
     barrier.wait()
     # The frozen output must not depend on the ambient warning policy (the
-    # CLI process owns a vault it never explicitly closes).
+    # CLI subprocess gets a scrubbed environment via cli_env).
     env = cli_env()
     line_pattern = re.compile(r"^([^\t]+)\tactive=(\d+)\tversions=(\d+(?:,\d+)*)$")
     commands = []

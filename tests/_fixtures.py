@@ -42,8 +42,8 @@ def cli_env() -> dict[str, str]:
     """Environment for a ``python -m keyvault_ledger`` subprocess.
 
     The frozen CLI outputs must not depend on the ambient warning policy: the
-    CLI process owns a vault it never explicitly closes, so an inherited
-    ``PYTHONWARNINGS`` setting would append ``ResourceWarning`` tail lines to
+    CLI process returns its vault handle on every exit path, but an inherited
+    ``PYTHONWARNINGS`` setting could still append unrelated warning lines to
     its otherwise frozen stderr.  Every subprocess therefore gets the same
     scrubbed environment.
     """
