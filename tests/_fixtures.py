@@ -11,7 +11,12 @@ cleanup runs, in one fixed order:
 3. drain the worker processes (terminating/killing anything still alive);
 4. return every vault lock handle via ``Vault.close`` — idempotent, safe to
    call on handles a case already closed;
-5. delete the whole temporary directory tree.
+5. delete the whole temporary directory tree.  Removal is never allowed to
+   fail silently: if the tree (or any part of it) survives the final
+   removal attempt, the case fails with an error naming the directory that
+   could not be deleted.  When the case itself already raised (a failed
+   assertion or any other error), that original exception is what the
+   runner reports — the cleanup neither swallows nor rewrites it.
 
 There is deliberately no second teardown route and no write-only handle
 registry: the tracked lists exist solely for this cleanup to read.
@@ -145,8 +150,12 @@ class VaultFixture:
             process.join(5)
 
         # 4. Return every lock handle.  close() is idempotent by contract, so
-        #    handles a case closed itself are harmless no-ops.
+        #    handles a case closed itself are harmless no-ops.  A failure here
+        #    is not swallowed: it is remembered and surfaced once the removal
+        #    attempt is done, unless the case itself already raised, in which
+        #    case the case's own exception wins verbatim.
         seen: set[int] = set()
+        handle_error: BaseException | None = None
         for vault in self._vaults:
             if id(vault) in seen:
                 continue
@@ -154,24 +163,52 @@ class VaultFixture:
             try:
                 vault.close()
                 vault.close()  # repeated release must stay an error-free no-op
-            except Exception:
-                # Teardown must never mask the case's own exception.
-                pass
+            except Exception as exc:
+                if handle_error is None:
+                    handle_error = exc
 
         # 5. Delete the whole temporary tree; every handle is back and every
-        #    worker gone, so the lock file cannot block removal.
+        #    worker gone, so the lock file cannot block removal.  A first
+        #    failure gets one recovery pass -- read-only leftovers (some cases
+        #    chmod files/dirs and restore them in their own cleanups) are made
+        #    writable once -- but a tree that still survives afterwards is a
+        #    hard test failure naming the directory, never a silent skip.
+        removal_error: BaseException | None = None
         try:
             self._tmp.cleanup()
-        except OSError:
-            # Read-only leftovers (some cases chmod files/dirs and restore
-            # them in their own cleanups): make the tree writable once and
-            # remove it outright, so nothing is ever left behind.
+        except OSError as exc:
+            removal_error = exc
             for base, dirs, files in os.walk(self.tmp_path, topdown=False):
                 for entry in files + dirs:
                     try:
                         os.chmod(os.path.join(base, entry), 0o700)
                     except OSError:
                         pass
-            shutil.rmtree(self.tmp_path, ignore_errors=True)
-            if self.tmp_path.exists():
-                raise
+            try:
+                shutil.rmtree(self.tmp_path)
+            except OSError as retry_exc:
+                # The directory vanishing between attempts is still success;
+                # only a tree that genuinely survives keeps the error.
+                if self.tmp_path.exists():
+                    removal_error = retry_exc
+                else:
+                    removal_error = None
+            else:
+                removal_error = None
+
+        if self.tmp_path.exists():
+            # Name exactly which directory the cleanup could not remove and
+            # list whatever is still inside it.
+            leftovers = sorted(
+                str(path.relative_to(self.tmp_path))
+                for path in self.tmp_path.rglob("*")
+            )
+            raise AssertionError(
+                "teardown could not delete temporary directory "
+                f"{self.tmp_path}: remaining entries: {leftovers}"
+            )
+
+        if handle_error is not None:
+            raise handle_error
+        if removal_error is not None:
+            raise removal_error

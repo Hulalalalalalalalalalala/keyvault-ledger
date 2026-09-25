@@ -1573,20 +1573,44 @@ class TestDerivationReloadValidation(VaultTestCase):
 
 class TestClose(VaultTestCase):
     def test_close_releases_lock_handle_and_is_idempotent(self):
+        # Assertions rest on observable outcomes only, never on private
+        # state: close() returns None and stays silent on repeats, and a
+        # second process acquires the very same lock immediately while this
+        # process holds no handle.
         vault = self.open_vault()
         vault.seal("k", b"m")
-        self.assertIsNotNone(vault._lock_fh)
-        vault.close()
-        self.assertIsNone(vault._lock_fh)
-        vault.close()  # repeated release is not an error
-        self.assertIsNone(vault._lock_fh)
+        self.assertIsNone(vault.close())
+        self.assertIsNone(vault.close())  # repeated release is not an error
+        self.assertIsNone(vault.close())
+
+        material = self.tmp_path / "external.bin"
+        material.write_bytes(b"external")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "keyvault_ledger",
+                "--root",
+                str(self.root),
+                "seal",
+                "ext",
+                "--material-file",
+                str(material),
+            ],
+            capture_output=True,
+            text=True,
+            env=cli_env(),
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1\n")
+        self.assertEqual(result.stderr, "")
 
     def test_operation_after_close_reopens_lock_with_same_behaviour(self):
         vault = self.open_vault()
         vault.seal("k", b"one")
         vault.close()
         self.assertEqual(vault.seal("k", b"two"), 2)
-        self.assertIsNotNone(vault._lock_fh)
         self.assertEqual(vault.load("k", 1), b"one")
         self.assertEqual(vault.load("k"), b"two")
         vault.close()
