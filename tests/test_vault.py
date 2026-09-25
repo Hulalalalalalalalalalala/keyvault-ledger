@@ -36,28 +36,40 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _seal_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
     vault = Vault(root)
-    for payload in payloads:
-        vault.seal(key_id, payload)
+    try:
+        for payload in payloads:
+            vault.seal(key_id, payload)
+    finally:
+        vault.close()
 
 
 def _reload_worker(root: str, count: int) -> None:
     vault = Vault(root)
-    for _ in range(count):
-        vault.reload()
+    try:
+        for _ in range(count):
+            vault.reload()
+    finally:
+        vault.close()
 
 
 def _revoke_worker(root: str, key_id: str, versions: list[int]) -> None:
     vault = Vault(root)
-    for version in versions:
-        vault.revoke(key_id, version)
-        vault.reload()
+    try:
+        for version in versions:
+            vault.revoke(key_id, version)
+            vault.reload()
+    finally:
+        vault.close()
 
 
 def _set_active_worker(root: str, key_id: str, versions: list[int]) -> None:
     vault = Vault(root)
-    for version in versions:
-        vault.set_active(key_id, version)
-        vault.reload()
+    try:
+        for version in versions:
+            vault.set_active(key_id, version)
+            vault.reload()
+    finally:
+        vault.close()
 
 
 class VaultTestCase(unittest.TestCase):
@@ -67,7 +79,18 @@ class VaultTestCase(unittest.TestCase):
         self.root = Path(self._tmp.name) / "vault"
 
     def open_vault(self) -> Vault:
-        return Vault(self.root)
+        """Open a vault and guarantee its lock handle is returned.
+
+        The ``close`` cleanup is registered *after* the temporary-directory
+        cleanup, so LIFO ordering releases every lock handle before the
+        temporary directory is removed.  Cleanups run even when a test fails
+        or raises, so a vault opened mid-case is closed the same way; the
+        original assertion/exception still propagates verbatim.  ``close``
+        is idempotent, so cases that close their vault themselves are fine.
+        """
+        vault = Vault(self.root)
+        self.addCleanup(vault.close)
+        return vault
 
     def manifest_path(self) -> Path:
         return self.root / MANIFEST_NAME
@@ -828,7 +851,7 @@ class TestActivationJournalValidation(VaultTestCase):
         vault.seal("k", b"m")
         self._write_activations(self._record(key_id="ghost"))
         with self.assertRaises(ValueError):
-            Vault(self.root)
+            self.open_vault()
 
     def test_malformed_records_are_rejected(self):
         vault = self.open_vault()
@@ -865,7 +888,7 @@ class TestActivationJournalValidation(VaultTestCase):
         self._write_activations(self._record(version=1, latest=2))
         vault.reload()
         self.assertEqual(vault.active("k"), 3)
-        self.assertEqual(Vault(self.root).active("k"), 3)
+        self.assertEqual(self.open_vault().active("k"), 3)
 
     def test_only_last_record_for_a_key_applies(self):
         vault = self.open_vault()
@@ -1237,8 +1260,11 @@ class TestMultiProcess(VaultTestCase):
 def _derive_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
     vault = Vault(root)
     salt = b"worker-salt"
-    for i, payload in enumerate(payloads):
-        vault.derive_seal(key_id, payload, salt, 100, 16)
+    try:
+        for payload in payloads:
+            vault.derive_seal(key_id, payload, salt, 100, 16)
+    finally:
+        vault.close()
 
 
 class TestDeriveSeal(VaultTestCase):
@@ -1447,7 +1473,12 @@ class TestDerivationReloadValidation(VaultTestCase):
 
     def _fresh_vault(self) -> tuple[Vault, Path]:
         root = Path(self._tmp.name) / f"case-{next(self._counter)}"
-        return Vault(root), root
+        vault = Vault(root)
+        # Registered after the temporary-directory cleanup (setUp), so the
+        # LIFO order releases this handle before the shared temp dir is
+        # removed; a failed assertion in the subTest still releases it.
+        self.addCleanup(vault.close)
+        return vault, root
 
     def setUp(self) -> None:
         super().setUp()
@@ -1617,6 +1648,9 @@ class TestWindowsLockFallback(VaultTestCase):
         with mock.patch.object(vault_mod, "fcntl", None):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
                 vault = Vault(self.root)
+                # Released again at cleanup (idempotent) if an assertion above
+                # fails before the explicit close inside this block.
+                self.addCleanup(vault.close)
                 self.assertEqual(vault.seal("k", b"m"), 1)
                 vault.derive_seal("k", b"pw", b"salt", 10, 8)
                 vault.seal("k", b"m2")
@@ -1626,7 +1660,9 @@ class TestWindowsLockFallback(VaultTestCase):
                 self.assertEqual(vault.active("k"), 1)
                 self.assertEqual(state["held"], {})
                 vault.close()
-        self.assertEqual(Vault(self.root).load("k", 1), b"m")
+        # Back on the ordinary fcntl branch; routed through open_vault so the
+        # handle is released at cleanup rather than dropped on the floor.
+        self.assertEqual(self.open_vault().load("k", 1), b"m")
 
     def test_fallback_retries_until_lock_is_released(self):
         import keyvault_ledger.vault as vault_mod
@@ -1661,6 +1697,28 @@ class TestWindowsLockFallback(VaultTestCase):
 
                 holder = threading.Thread(target=hold)
                 holder.start()
+
+                def _close_test_vaults() -> None:
+                    # Runs last (LIFO), after both threads are joined below;
+                    # close() only shuts file handles, so it is safe outside
+                    # the mock-patch context too and harmless when repeated.
+                    holder_vault.close()
+                    waiter.close()
+
+                def _join_holder_thread() -> None:
+                    # Release and join the holder before closing its vault:
+                    # close() takes the vault's in-process RLock, which the
+                    # holder thread still owns while parked on the event, so
+                    # closing first would deadlock if an assertion failed
+                    # before the normal join below.
+                    release_holder.set()
+                    holder.join(timeout=5)
+
+                # Registered first so LIFO ordering runs it last; the two
+                # thread-join cleanups registered afterwards drain the
+                # threads before any handle is closed.
+                self.addCleanup(_close_test_vaults)
+                self.addCleanup(_join_holder_thread)
                 self.assertTrue(holder_ready.wait(timeout=5))
 
                 seal_done = threading.Event()
@@ -1674,6 +1732,15 @@ class TestWindowsLockFallback(VaultTestCase):
 
                 sealer = threading.Thread(target=do_seal)
                 sealer.start()
+
+                def _join_sealer_thread() -> None:
+                    # If an assertion failed while the sealer was blocked on
+                    # the holder, release it and wait for the seal to finish
+                    # so the thread cannot race the handle-closing cleanup.
+                    release_holder.set()
+                    sealer.join(timeout=5)
+
+                self.addCleanup(_join_sealer_thread)
                 # Holder keeps the lock well past the first 0.05s retry, so
                 # the sealer is guaranteed blocked, having seen contention.
                 sealer.join(timeout=1.0)
