@@ -14,7 +14,9 @@ cleanup runs, in one fixed order:
 5. delete the whole temporary directory tree.  Removal is never allowed to
    fail silently: if the tree (or any part of it) survives the final
    removal attempt, the case fails with an error naming the directory that
-   could not be deleted.  When the case itself already raised (a failed
+   could not be deleted.  If a lock handle also failed to come back, the
+   same failure names that too -- the removal step never swallows a handle
+   error.  When the case itself already raised (a failed
    assertion or any other error), that original exception is what the
    runner reports — the cleanup neither swallows nor rewrites it.
 
@@ -198,15 +200,24 @@ class VaultFixture:
 
         if self.tmp_path.exists():
             # Name exactly which directory the cleanup could not remove and
-            # list whatever is still inside it.
+            # list whatever is still inside it.  A handle that also failed to
+            # come back is named in the same failure -- the removal step must
+            # never swallow it -- while a clean handle return keeps the
+            # message about the removal alone.
             leftovers = sorted(
                 str(path.relative_to(self.tmp_path))
                 for path in self.tmp_path.rglob("*")
             )
-            raise AssertionError(
+            message = (
                 "teardown could not delete temporary directory "
                 f"{self.tmp_path}: remaining entries: {leftovers}"
             )
+            if handle_error is not None:
+                message += (
+                    "; a vault lock handle was not returned cleanly: "
+                    f"{handle_error!r}"
+                )
+            raise AssertionError(message)
 
         if handle_error is not None:
             raise handle_error
