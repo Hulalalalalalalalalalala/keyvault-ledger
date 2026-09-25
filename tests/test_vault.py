@@ -12,7 +12,6 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import types
 import unittest
@@ -30,8 +29,7 @@ from keyvault_ledger.vault import (
     _derive_material,
     _dump_manifest,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from tests._fixtures import VaultFixture, cli_env
 
 
 def _seal_worker(root: str, key_id: str, payloads: list[bytes]) -> None:
@@ -74,23 +72,19 @@ def _set_active_worker(root: str, key_id: str, versions: list[int]) -> None:
 
 class VaultTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name) / "vault"
+        self.fixture = VaultFixture(self)
+        self.tmp_path = self.fixture.tmp_path
+        self.root = self.fixture.root
 
-    def open_vault(self) -> Vault:
-        """Open a vault and guarantee its lock handle is returned.
+    def open_vault(self, root: Path | str | None = None) -> Vault:
+        """Open a vault through the case's single teardown path.
 
-        The ``close`` cleanup is registered *after* the temporary-directory
-        cleanup, so LIFO ordering releases every lock handle before the
-        temporary directory is removed.  Cleanups run even when a test fails
-        or raises, so a vault opened mid-case is closed the same way; the
-        original assertion/exception still propagates verbatim.  ``close``
-        is idempotent, so cases that close their vault themselves are fine.
+        Every opened handle is returned by the fixture cleanup, which runs
+        even when a test fails or raises; the original assertion/exception
+        still propagates verbatim.  ``close`` is idempotent, so cases that
+        close their vault themselves are fine.
         """
-        vault = Vault(self.root)
-        self.addCleanup(vault.close)
-        return vault
+        return self.fixture.open(root)
 
     def manifest_path(self) -> Path:
         return self.root / MANIFEST_NAME
@@ -997,10 +991,16 @@ class TestSealCleanup(VaultTestCase):
             Vault, "_load_validated", autospec=True, side_effect=slow_load
         ):
             reloader = threading.Thread(target=vault.reload)
+            # If an assertion fails while the reloader parks the sealer, the
+            # single fixture cleanup releases this gate and drains both
+            # threads before the vault handle is returned.
+            self.fixture.track_gate(release_read)
+            self.fixture.track_thread(reloader)
             reloader.start()
             self.assertTrue(read_started.wait(timeout=5))
 
             sealer = threading.Thread(target=do_seal)
+            self.fixture.track_thread(sealer)
             sealer.start()
             # The reload holds the lock for the whole read, so the seal
             # cannot complete until the read finishes: it is blocked and
@@ -1472,12 +1472,8 @@ class TestDerivationReloadValidation(VaultTestCase):
     SALT = b"salty-salt"
 
     def _fresh_vault(self) -> tuple[Vault, Path]:
-        root = Path(self._tmp.name) / f"case-{next(self._counter)}"
-        vault = Vault(root)
-        # Registered after the temporary-directory cleanup (setUp), so the
-        # LIFO order releases this handle before the shared temp dir is
-        # removed; a failed assertion in the subTest still releases it.
-        self.addCleanup(vault.close)
+        root = self.tmp_path / f"case-{next(self._counter)}"
+        vault = self.open_vault(root)
         return vault, root
 
     def setUp(self) -> None:
@@ -1647,10 +1643,7 @@ class TestWindowsLockFallback(VaultTestCase):
         fake, state = self._fake_msvcrt()
         with mock.patch.object(vault_mod, "fcntl", None):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
-                vault = Vault(self.root)
-                # Released again at cleanup (idempotent) if an assertion above
-                # fails before the explicit close inside this block.
-                self.addCleanup(vault.close)
+                vault = self.open_vault()
                 self.assertEqual(vault.seal("k", b"m"), 1)
                 vault.derive_seal("k", b"pw", b"salt", 10, 8)
                 vault.seal("k", b"m2")
@@ -1661,7 +1654,7 @@ class TestWindowsLockFallback(VaultTestCase):
                 self.assertEqual(state["held"], {})
                 vault.close()
         # Back on the ordinary fcntl branch; routed through open_vault so the
-        # handle is released at cleanup rather than dropped on the floor.
+        # handle is returned by the same teardown path rather than dropped.
         self.assertEqual(self.open_vault().load("k", 1), b"m")
 
     def test_fallback_retries_until_lock_is_released(self):
@@ -1672,8 +1665,8 @@ class TestWindowsLockFallback(VaultTestCase):
             with mock.patch.dict(sys.modules, {"msvcrt": fake}):
                 # Both handles exist before anyone holds the lock, so their
                 # construction never contends.
-                holder_vault = Vault(self.root)
-                waiter = Vault(self.root)
+                holder_vault = self.open_vault()
+                waiter = self.open_vault()
                 holder_vault.seal("k", b"seed")
 
                 holder_ready = threading.Event()
@@ -1696,29 +1689,14 @@ class TestWindowsLockFallback(VaultTestCase):
                         holder_error.append(exc)
 
                 holder = threading.Thread(target=hold)
+                # The single fixture teardown releases the gate and drains
+                # this thread before holder_vault is closed: close() takes
+                # the vault's in-process RLock, which the holder owns while
+                # parked on the event, so draining first is what keeps an
+                # assertion failure below from deadlocking the cleanup.
+                self.fixture.track_gate(release_holder)
+                self.fixture.track_thread(holder)
                 holder.start()
-
-                def _close_test_vaults() -> None:
-                    # Runs last (LIFO), after both threads are joined below;
-                    # close() only shuts file handles, so it is safe outside
-                    # the mock-patch context too and harmless when repeated.
-                    holder_vault.close()
-                    waiter.close()
-
-                def _join_holder_thread() -> None:
-                    # Release and join the holder before closing its vault:
-                    # close() takes the vault's in-process RLock, which the
-                    # holder thread still owns while parked on the event, so
-                    # closing first would deadlock if an assertion failed
-                    # before the normal join below.
-                    release_holder.set()
-                    holder.join(timeout=5)
-
-                # Registered first so LIFO ordering runs it last; the two
-                # thread-join cleanups registered afterwards drain the
-                # threads before any handle is closed.
-                self.addCleanup(_close_test_vaults)
-                self.addCleanup(_join_holder_thread)
                 self.assertTrue(holder_ready.wait(timeout=5))
 
                 seal_done = threading.Event()
@@ -1731,16 +1709,11 @@ class TestWindowsLockFallback(VaultTestCase):
                     seal_done.set()
 
                 sealer = threading.Thread(target=do_seal)
+                # If an assertion fails while the sealer is blocked on the
+                # holder, that same gate-release/thread-drain cleanup lets
+                # the seal finish before any handle is returned.
+                self.fixture.track_thread(sealer)
                 sealer.start()
-
-                def _join_sealer_thread() -> None:
-                    # If an assertion failed while the sealer was blocked on
-                    # the holder, release it and wait for the seal to finish
-                    # so the thread cannot race the handle-closing cleanup.
-                    release_holder.set()
-                    sealer.join(timeout=5)
-
-                self.addCleanup(_join_sealer_thread)
                 # Holder keeps the lock well past the first 0.05s retry, so
                 # the sealer is guaranteed blocked, having seen contention.
                 sealer.join(timeout=1.0)
@@ -1759,8 +1732,6 @@ class TestWindowsLockFallback(VaultTestCase):
 
 class CliTestCase(VaultTestCase):
     def run_cli(self, *args: str, root: Path | str | None = None) -> subprocess.CompletedProcess:
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         return subprocess.run(
             [
                 sys.executable,
@@ -1772,11 +1743,11 @@ class CliTestCase(VaultTestCase):
             ],
             capture_output=True,
             text=True,
-            env=env,
+            env=cli_env(),
         )
 
     def material_file(self, name: str, data: bytes) -> Path:
-        path = Path(self._tmp.name) / name
+        path = self.tmp_path / name
         path.write_bytes(data)
         return path
 
@@ -1784,7 +1755,7 @@ class CliTestCase(VaultTestCase):
 class TestCli(CliTestCase):
 
     def test_seal_versions_reload_round_trip(self):
-        material = Path(self._tmp.name) / "material.bin"
+        material = self.tmp_path / "material.bin"
         material.write_bytes(b"cli-material")
 
         result = self.run_cli("seal", "cli-key", "--material-file", str(material))
@@ -1810,7 +1781,7 @@ class TestCli(CliTestCase):
         self.assertEqual(result.stdout, "")
 
     def test_cli_reports_errors(self):
-        material = Path(self._tmp.name) / "material.bin"
+        material = self.tmp_path / "material.bin"
         material.write_bytes(b"x")
         result = self.run_cli("seal", "", "--material-file", str(material))
         self.assertNotEqual(result.returncode, 0)
@@ -1912,7 +1883,7 @@ class TestCliSealErrors(CliTestCase):
         self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
 
     def test_missing_material_file_is_rejected_with_its_path(self):
-        missing = Path(self._tmp.name) / "absent.bin"
+        missing = self.tmp_path / "absent.bin"
         result = self.run_cli("seal", "k", "--material-file", str(missing))
         self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
@@ -1922,7 +1893,7 @@ class TestCliSealErrors(CliTestCase):
         )
 
     def test_material_file_that_is_a_directory_is_rejected(self):
-        directory = Path(self._tmp.name) / "a-dir"
+        directory = self.tmp_path / "a-dir"
         directory.mkdir()
         result = self.run_cli("seal", "k", "--material-file", str(directory))
         self.assertEqual(result.returncode, 1)
@@ -1957,7 +1928,7 @@ class TestCliSealErrors(CliTestCase):
             for path in (self.root / MATERIALS_DIR).rglob("*.bin")
         )
 
-        missing = Path(self._tmp.name) / "absent.bin"
+        missing = self.tmp_path / "absent.bin"
         failed_missing = self.run_cli(
             "seal", "k", "--material-file", str(missing)
         )
@@ -1999,7 +1970,7 @@ class TestCliManifestMissing(CliTestCase):
         # but no manifest is treated as corruption, not as a new vault.  The
         # missing-manifest error is frozen as-is; the CLI does not silently
         # create a manifest to repair it.
-        root = Path(self._tmp.name) / "stray"
+        root = self.tmp_path / "stray"
         root.mkdir()
         (root / "notes.txt").write_bytes(b"not a vault")
         material = self.material_file("m.bin", b"m")
@@ -2114,7 +2085,7 @@ class TestCliReloadFailure(CliTestCase):
 class TestCliVaultDirectoryProblems(CliTestCase):
     def test_root_that_is_a_file_is_rejected_by_every_entry(self):
         material = self.material_file("m.bin", b"m")
-        root = Path(self._tmp.name) / "a-file"
+        root = self.tmp_path / "a-file"
         root.write_bytes(b"not a directory")
         expected = f"error: [Errno 17] File exists: '{root}'\n"
         for argv in (
@@ -2132,7 +2103,7 @@ class TestCliVaultDirectoryProblems(CliTestCase):
         "permission bits are not enforced for root",
     )
     def test_root_under_a_non_writable_parent_is_rejected(self):
-        parent = Path(self._tmp.name) / "ro-parent"
+        parent = self.tmp_path / "ro-parent"
         parent.mkdir()
         parent.chmod(0o555)
         self.addCleanup(lambda: parent.chmod(0o755))
@@ -2186,7 +2157,7 @@ class TestCliVaultDirectoryProblems(CliTestCase):
 
 class TestCliDeterminism(CliTestCase):
     def _scripted_run(self, root: Path, missing: Path) -> list[tuple[int, str, str]]:
-        material = Path(self._tmp.name) / "shared-material.bin"
+        material = self.tmp_path / "shared-material.bin"
         material.write_bytes(b"m")
         captured: list[tuple[int, str, str]] = []
         for argv in (
@@ -2205,9 +2176,9 @@ class TestCliDeterminism(CliTestCase):
         return captured
 
     def test_same_inputs_in_two_fresh_vaults_yield_identical_outputs(self):
-        missing = Path(self._tmp.name) / "absent.bin"
-        root_a = Path(self._tmp.name) / "a"
-        root_b = Path(self._tmp.name) / "b"
+        missing = self.tmp_path / "absent.bin"
+        root_a = self.tmp_path / "a"
+        root_b = self.tmp_path / "b"
         self.assertEqual(
             self._scripted_run(root_a, missing),
             self._scripted_run(root_b, missing),
@@ -2218,13 +2189,11 @@ class TestCliInvocationShape(CliTestCase):
     """The README entry-point names, arguments and call shape are frozen."""
 
     def test_missing_root_exits_two_with_frozen_usage(self):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
             [sys.executable, "-m", "keyvault_ledger", "versions"],
             capture_output=True,
             text=True,
-            env=env,
+            env=cli_env(),
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
@@ -2237,8 +2206,6 @@ class TestCliInvocationShape(CliTestCase):
         )
 
     def test_unknown_subcommand_exits_two_with_frozen_usage(self):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
             [
                 sys.executable,
@@ -2250,7 +2217,7 @@ class TestCliInvocationShape(CliTestCase):
             ],
             capture_output=True,
             text=True,
-            env=env,
+            env=cli_env(),
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
@@ -2263,8 +2230,6 @@ class TestCliInvocationShape(CliTestCase):
         )
 
     def test_seal_without_material_file_exits_two_with_frozen_usage(self):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
             [
                 sys.executable,
@@ -2277,7 +2242,7 @@ class TestCliInvocationShape(CliTestCase):
             ],
             capture_output=True,
             text=True,
-            env=env,
+            env=cli_env(),
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
@@ -2290,8 +2255,6 @@ class TestCliInvocationShape(CliTestCase):
         )
 
     def test_seal_without_key_id_or_material_exits_two_with_frozen_usage(self):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         result = subprocess.run(
             [
                 sys.executable,
@@ -2303,7 +2266,7 @@ class TestCliInvocationShape(CliTestCase):
             ],
             capture_output=True,
             text=True,
-            env=env,
+            env=cli_env(),
         )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")

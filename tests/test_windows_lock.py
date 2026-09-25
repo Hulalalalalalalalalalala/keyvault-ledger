@@ -48,7 +48,6 @@ import multiprocessing
 import os
 import queue as queue_mod
 import sys
-import tempfile
 import time
 import types
 import unittest
@@ -65,6 +64,7 @@ from keyvault_ledger.vault import (
     REVOCATIONS_NAME,
     _dump_manifest,
 )
+from tests._fixtures import VaultFixture
 
 try:
     import fcntl as _os_fcntl
@@ -276,9 +276,8 @@ def _win_close_dance_b(
 )
 class WindowsLockTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name) / "vault"
+        self.fixture = VaultFixture(self)
+        self.root = self.fixture.root
         # The whole test — parent side included — runs on the Windows
         # branch; both patches are reverted at teardown so no other test
         # module is affected regardless of execution order.  The
@@ -287,6 +286,11 @@ class WindowsLockTestCase(unittest.TestCase):
         # teardown, which would evict modules lazily imported during the
         # patch window (notably ``multiprocessing.connection``) and break
         # their singleton identity.
+        #
+        # These two patch cleanups are registered after the fixture cleanup,
+        # so LIFO order restores the branches first; closing the tracked
+        # handles and deleting the directory (the single fixture teardown)
+        # happen last, exactly like the previous temp-dir cleanup did.
         fcntl_patch = mock.patch.object(vault_mod, "fcntl", None)
         fcntl_patch.start()
         self.addCleanup(fcntl_patch.stop)
@@ -303,11 +307,8 @@ class WindowsLockTestCase(unittest.TestCase):
         self.addCleanup(restore_msvcrt)
 
     def open_vault(self) -> Vault:
-        vault = Vault(self.root)
-        # Registered after the temp-dir cleanup, so LIFO ordering releases
-        # every lock handle before the temporary directory is removed.
-        self.addCleanup(vault.close)
-        return vault
+        """Open a vault; its handle is returned by the single teardown."""
+        return self.fixture.open()
 
     def disk_manifest(self) -> dict:
         return json.loads((self.root / MANIFEST_NAME).read_bytes().decode("utf-8"))
@@ -330,6 +331,9 @@ class WindowsLockTestCase(unittest.TestCase):
         processes: list[multiprocessing.Process],
         timeout: float = 90,
     ) -> None:
+        # Tracked so the single teardown drains them even when an assertion
+        # in this case fails while they are running.
+        self.fixture.track_process(*processes)
         for process in processes:
             process.start()
         for process in processes:
@@ -375,6 +379,7 @@ class TestWindowsBranchContention(WindowsLockTestCase):
         ]
         total = writers * each
         barrier = multiprocessing.Barrier(writers)
+        self.fixture.track_barrier(barrier)
         results: multiprocessing.Queue = multiprocessing.Queue()
         processes = [
             multiprocessing.Process(
@@ -425,6 +430,11 @@ class TestWindowsBranchContention(WindowsLockTestCase):
         holder = multiprocessing.Process(
             target=_win_lock_holder, args=(str(self.root), ready, release)
         )
+        # On a failed assertion the single teardown releases this gate and
+        # drains holder and the blocked sealer: the blocked write proceeds
+        # and finishes with its result unchanged.
+        self.fixture.track_gate(release)
+        self.fixture.track_process(holder)
         holder.start()
         self.assertTrue(ready.wait(timeout=10))
 
@@ -433,6 +443,7 @@ class TestWindowsBranchContention(WindowsLockTestCase):
             target=_win_seal_payloads,
             args=(str(self.root), "k", [b"m-2"], results),
         )
+        self.fixture.track_process(sealer)
         sealer.start()
 
         # While the holder keeps the lock the sealer stays parked: no
@@ -461,13 +472,11 @@ class TestWindowsBranchContention(WindowsLockTestCase):
 
         # The contended run lands exactly the same bytes as running the
         # same two seals with no contention at all.
-        reference_root = Path(self._tmp.name) / "reference"
-        reference = Vault(reference_root)
-        try:
-            reference.seal("k", b"m-1")
-            reference.seal("k", b"m-2")
-        finally:
-            reference.close()
+        reference_root = self.fixture.path("reference")
+        reference = self.fixture.open(reference_root)
+        reference.seal("k", b"m-1")
+        reference.seal("k", b"m-2")
+        reference.close()
         self.assertEqual(
             self.disk_bytes(),
             self.disk_bytes(reference_root),
@@ -486,6 +495,7 @@ class TestWindowsBranchContention(WindowsLockTestCase):
         total = writers * each
         all_payloads = {payload for group in payloads for payload in group}
         barrier = multiprocessing.Barrier(writers + 1)
+        self.fixture.track_barrier(barrier)
         results: multiprocessing.Queue = multiprocessing.Queue()
         processes = [
             multiprocessing.Process(
@@ -499,6 +509,7 @@ class TestWindowsBranchContention(WindowsLockTestCase):
             target=_win_prefix_reader,
             args=(str(self.root), "k", all_payloads, total, reader_results, barrier),
         )
+        self.fixture.track_process(reader)
         reader.start()
         self.run_processes(processes)
         reader.join(timeout=60)
@@ -532,6 +543,10 @@ class TestWindowsCloseRelease(WindowsLockTestCase):
         a = multiprocessing.Process(
             target=_win_close_dance_a, args=(str(self.root), "k", closed, peer_done)
         )
+        # A failed assertion releases both handoff gates and drains both
+        # processes through the single teardown.
+        self.fixture.track_gate(closed, peer_done)
+        self.fixture.track_process(a, b)
         b.start()
         a.start()
         for process in (a, b):

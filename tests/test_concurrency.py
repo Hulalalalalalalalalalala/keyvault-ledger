@@ -35,7 +35,6 @@ import queue as queue_mod
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import unittest
@@ -49,8 +48,7 @@ from keyvault_ledger.vault import (
     MATERIALS_DIR,
     REVOCATIONS_NAME,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from tests._fixtures import VaultFixture, cli_env
 
 
 # ---------------------------------------------------------------------------
@@ -356,11 +354,9 @@ def _cli_hammer(
     barrier: "multiprocessing.managers.Barrier",
 ) -> None:
     barrier.wait()
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
     # The frozen output must not depend on the ambient warning policy (the
     # CLI process owns a vault it never explicitly closes).
-    env.pop("PYTHONWARNINGS", None)
+    env = cli_env()
     line_pattern = re.compile(r"^([^\t]+)\tactive=(\d+)\tversions=(\d+(?:,\d+)*)$")
     commands = []
     try:
@@ -455,22 +451,12 @@ def _close_dance_b(
 
 class ConcurrencyTestCase(unittest.TestCase):
     def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.root = Path(self._tmp.name) / "vault"
-        self._opened_vaults: list[Vault] = []
+        self.fixture = VaultFixture(self)
+        self.root = self.fixture.root
 
     def open_vault(self) -> Vault:
-        vault = Vault(self.root)
-        # Registered after the temp-dir cleanup, so LIFO ordering releases
-        # every lock handle before the temporary directory is removed.
-        self.addCleanup(self._close_vault, vault)
-        self._opened_vaults.append(vault)
-        return vault
-
-    @staticmethod
-    def _close_vault(vault: Vault) -> None:
-        vault.close()
+        """Open a vault; its handle is returned by the single teardown."""
+        return self.fixture.open()
 
     def disk_manifest(self) -> dict:
         return json.loads((self.root / MANIFEST_NAME).read_bytes().decode("utf-8"))
@@ -486,6 +472,9 @@ class ConcurrencyTestCase(unittest.TestCase):
         processes: list[multiprocessing.Process],
         timeout: float = 90,
     ) -> None:
+        # Tracked so the single teardown drains them even when an assertion
+        # in this case fails while they are running.
+        self.fixture.track_process(*processes)
         for process in processes:
             process.start()
         for process in processes:
@@ -533,6 +522,12 @@ class TestCrossProcessLockSerialisation(ConcurrencyTestCase):
         holder = multiprocessing.Process(
             target=_held_lock_holder, args=(str(self.root), "k", 1, ready, release)
         )
+        # If an assertion fails while the holder parks the waiters, the
+        # single teardown sets this gate and drains every process before the
+        # parent handle is returned: the blocked writes proceed and finish,
+        # their results unchanged.
+        self.fixture.track_gate(release)
+        self.fixture.track_process(holder)
         holder.start()
         self.assertTrue(ready.wait(timeout=10))
 
@@ -546,6 +541,7 @@ class TestCrossProcessLockSerialisation(ConcurrencyTestCase):
             target=_revoke_partition, args=(str(self.root), "k", [2])
         )
         reloader = multiprocessing.Process(target=_reload_rounds, args=(str(self.root), 1))
+        self.fixture.track_process(sealer, revoker, reloader)
         for waiter in (sealer, revoker, reloader):
             waiter.start()
 
@@ -595,6 +591,7 @@ class TestCrossProcessLockSerialisation(ConcurrencyTestCase):
 
         procs = 3
         barrier = multiprocessing.Barrier(procs + 1 + 2)  # revokers + sealer + readers
+        self.fixture.track_barrier(barrier)
         workers = [
             multiprocessing.Process(
                 target=_revoke_partition,
@@ -672,6 +669,9 @@ class TestReloadSealInterleaving(ConcurrencyTestCase):
                 ready,
             ),
         )
+        # Both processes are drained by the single teardown if an assertion
+        # fails while they are still running.
+        self.fixture.track_process(reader)
         reader.start()
         self.assertTrue(ready.wait(timeout=15))
         gate.set()
@@ -679,6 +679,7 @@ class TestReloadSealInterleaving(ConcurrencyTestCase):
             target=_seal_payloads,
             args=(str(self.root), "k", payloads[1:], None, gate),
         )
+        self.fixture.track_process(sealer)
         sealer.start()
         sealer.join(timeout=60)
         self.assertEqual(sealer.exitcode, 0)
@@ -717,6 +718,9 @@ class TestReloadSealInterleaving(ConcurrencyTestCase):
             for password in derived_passwords
         ]
         barrier = multiprocessing.Barrier(5)
+        # Aborted at teardown if an assertion fails before every party has
+        # shown up, so no worker waits forever for a missing party.
+        self.fixture.track_barrier(barrier)
         workers = [
             multiprocessing.Process(
                 target=_seal_payloads,
@@ -756,6 +760,7 @@ class TestReloadSealInterleaving(ConcurrencyTestCase):
             ),
         )
         reader.start()  # joins the barrier last, then everyone starts together
+        self.fixture.track_process(reader)
         self.run_processes(workers)
         reader.join(timeout=60)
         self.assertEqual(reader.exitcode, 0)
@@ -780,6 +785,7 @@ class TestReloadSealInterleaving(ConcurrencyTestCase):
         sealers = 3
         each = 4
         barrier = multiprocessing.Barrier(sealers + 1)
+        self.fixture.track_barrier(barrier)
         workers = [
             multiprocessing.Process(
                 target=_seal_payloads,
@@ -796,6 +802,7 @@ class TestReloadSealInterleaving(ConcurrencyTestCase):
         hammer = multiprocessing.Process(
             target=_cli_hammer, args=(str(self.root), rounds, results, barrier)
         )
+        self.fixture.track_process(hammer)
         hammer.start()
         self.run_processes(workers)
         hammer.join(timeout=60)
@@ -856,6 +863,11 @@ class TestFailedReloadInvariance(ConcurrencyTestCase):
             target=_faulted_state_reader,
             args=(str(self.root), facts, opened, begin, recovered, errors),
         )
+        # The reader parks on ``begin`` and later ``recovered``; on a failed
+        # assertion the single teardown releases those gates and drains the
+        # reader (and every opener) before the parent handle is returned.
+        self.fixture.track_gate(begin, recovered)
+        self.fixture.track_process(reader)
         reader.start()
         self.assertTrue(opened.wait(timeout=10))
 
@@ -875,6 +887,7 @@ class TestFailedReloadInvariance(ConcurrencyTestCase):
         ]
         for opener in openers:
             opener.start()
+        self.fixture.track_process(*openers)
         for opener in openers:
             opener.join(timeout=30)
             self.assertEqual(opener.exitcode, 0)
@@ -967,6 +980,7 @@ class TestLockFileIsOnlyAMutex(ConcurrencyTestCase):
         worker = multiprocessing.Process(
             target=_lock_content_worker, args=(str(self.root),)
         )
+        self.fixture.track_process(worker)
         worker.start()
         worker.join(timeout=30)
         self.assertEqual(worker.exitcode, 0)
@@ -1008,6 +1022,10 @@ class TestCloseRelease(ConcurrencyTestCase):
         a = multiprocessing.Process(
             target=_close_dance_a, args=(str(self.root), "k", closed, peer_done)
         )
+        # A failed assertion in this case releases both handoff gates and
+        # drains both processes through the single teardown.
+        self.fixture.track_gate(closed, peer_done)
+        self.fixture.track_process(a, b)
         b.start()
         a.start()
         for process in (a, b):
@@ -1070,6 +1088,7 @@ class TestThreadedInterleaving(ConcurrencyTestCase):
         # Phase 1: concurrent seals allocate one strict sequence.
         thread_count, each = 6, 6
         barrier = threading.Barrier(thread_count)
+        self.fixture.track_barrier(barrier)
         phase_a = {
             f"a-{t}-{i}".encode("utf-8")
             for t in range(thread_count)
@@ -1091,6 +1110,9 @@ class TestThreadedInterleaving(ConcurrencyTestCase):
         threads = [
             threading.Thread(target=seal_phase, args=(t,)) for t in range(thread_count)
         ]
+        # The single teardown aborts the barrier and drains these threads
+        # before returning any handle if an assertion fails midway.
+        self.fixture.track_thread(*threads)
         for thread in threads:
             thread.start()
         for thread in threads:
@@ -1179,6 +1201,11 @@ class TestThreadedInterleaving(ConcurrencyTestCase):
             threading.Thread(target=repoint),
             threading.Thread(target=reader),
         ]
+        # The reader only exits its loop once ``sealers_done`` is set; treat
+        # it as a gate so a failed assertion still lets the reader finish and
+        # every thread drains before handles are returned.
+        self.fixture.track_gate(sealers_done)
+        self.fixture.track_thread(*workers)
         for worker in workers:
             worker.start()
         for worker in workers[:-1]:
