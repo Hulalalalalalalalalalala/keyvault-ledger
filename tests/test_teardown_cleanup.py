@@ -208,6 +208,35 @@ def _force_handle_and_removal_failure(
     return fixture, vault
 
 
+def _simulate_handle_return_failure(vault: Vault):
+    """Force ``vault.close`` to fail while the real lock handle stays released.
+
+    On Windows a lock file that is still open cannot be deleted, so a handle
+    whose return fails must give the OS file handle back *before* the failure
+    is raised; only then can the teardown's real, healthy removal delete the
+    whole tree (``vault.lock`` included) instead of stumbling over the file
+    in use.  The replacement therefore performs the genuine release exactly
+    once -- ``Vault.close`` is idempotent, so the second teardown call is the
+    same harmless no-op -- and only then raises the fixed failure.  The
+    raised exception is the direct cause carrying its genuine traceback,
+    while no open lock survives to reach interpreter shutdown as a
+    ``ResourceWarning`` or to leave a lock file behind.
+
+    Returns the unstarted patcher; the caller starts/stops it as a context
+    manager once the failure has surfaced.
+    """
+    real_close = vault.close  # bound to the class method before it is patched
+    released = {"done": False}
+
+    def failing_close():
+        if not released["done"]:
+            released["done"] = True
+            real_close()  # really return the OS handle before reporting failure
+        raise RuntimeError("simulated close failure")
+
+    return mock.patch.object(vault, "close", side_effect=failing_close)
+
+
 # Stable, platform-independent simulation of the single exit's last branch:
 # the temporary tree has already been cleared, and returning the lock handle
 # and deleting the tree both fail.  The tree keeps one fixed leaf name, but
@@ -799,18 +828,29 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         )
         vault = fixture.open()
         vault.seal("k", b"m")
-        with mock.patch.object(
-            vault, "close", side_effect=RuntimeError("simulated close failure")
-        ):
+        lock_path = fixture.root / "vault.lock"
+        self.assertTrue(lock_path.exists())
+        # The handle return fails, yet it gives the real OS lock handle back
+        # *before* raising.  On Windows an open lock file cannot be deleted,
+        # so leaving the handle open would make the healthy real removal fail
+        # too and leave the lock behind; releasing first lets the very same
+        # real, unpatched removal delete the whole tree on every platform.
+        with _simulate_handle_return_failure(vault):
             with self.assertRaises(RuntimeError) as caught:
                 fixture._cleanup()
         self.assertEqual(str(caught.exception), "simulated close failure")
-        # The simulated failure skipped the real handle return; the mock is
-        # gone now, so close for real and leave no unclosed lock handle
-        # (which would surface as a ResourceWarning at interpreter shutdown).
-        vault.close()
-        # The directory step still ran before the handle error was raised.
+        self.assertIsNone(caught.exception.__cause__)
+        # The failing return really released the OS handle, so no
+        # ResourceWarning can follow at shutdown and -- crucially on Windows
+        # -- the in-use lock file no longer blocks removal: the directory
+        # step really ran (unpatched) and deleted the lock with everything
+        # else before the handle error was raised.
+        self.assertFalse(lock_path.exists())
+        self.assertFalse(fixture.root.exists())
         self.assertFalse(fixture.tmp_path.exists())
+        # Returning the handle stays repeatable and error-free afterwards.
+        self.assertIsNone(vault.close())
+        self.assertIsNone(vault.close())
 
     def test_original_assertion_is_reported_verbatim_when_cleanup_fails(self):
         _SIMULATED_PATHS.clear()
