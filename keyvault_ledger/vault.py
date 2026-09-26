@@ -847,8 +847,10 @@ class Vault:
         seal supersedes the repoint without the journal being touched.  A
         repointed version that is revoked later does not move the pointer —
         ``revoke`` never does — so a revoked target still applies here.
-        Raises ``ValueError`` if the journal is unreadable or corrupt, or if
-        a record targets a key/version that never existed.
+        Raises ``ValueError`` if the journal is unreadable or corrupt, if a
+        record carries anything beyond the three documented fields
+        (``key_id``, ``version``, ``latest``), or if a record targets a
+        key/version that never existed.
         """
         journal_path = self._root / ACTIVATIONS_NAME
         if not journal_path.exists():
@@ -891,6 +893,14 @@ class Vault:
                 raise ValueError(
                     f"activation journal corrupt: key {key_id!r} record has "
                     "bad latest"
+                )
+            if set(record) - {"key_id", "version", "latest"}:
+                # The documented record shape is exactly the three fields
+                # checked above; anything beyond them is not a record this
+                # vault could have written.
+                raise ValueError(
+                    f"activation journal corrupt: key {key_id!r} record has "
+                    "unexpected fields"
                 )
             entry = snapshot.get(key_id)
             if entry is None:

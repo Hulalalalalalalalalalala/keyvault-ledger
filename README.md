@@ -95,6 +95,41 @@ material and the revocation journal: a corrupt record or one pointing at a
 key/version that never existed makes the reload fail with `ValueError` while
 the existing snapshot and disk records stay untouched.
 
+### The activation journal
+
+Every `set_active` call appends exactly one line to `activations.jsonl` in
+the vault root: one JSON object per line, in write order, so the file order
+is the order the repoints happened. A vault that was never repointed has no
+such file; the first repoint creates it. Each line carries exactly three
+fields and lands on disk byte-for-byte like this:
+
+    {"key_id": "plain", "latest": 2, "version": 1}
+
+- `key_id` (string): the key whose active version was repointed.
+- `version` (integer): the historical version the key was repointed at.
+- `latest` (integer): the binding value — the key's newest sealed version
+  at the moment the record was written.
+
+The binding value scopes the record: a repoint is honoured only while its
+`latest` still equals the key's newest sealed version. Sealing (or
+deriving) a higher version afterwards makes that new version active again,
+exactly as if the key had never been repointed; the older records stay in
+the journal untouched but no longer apply. Among the records still bound,
+the last one written for a key wins; earlier ones are kept as history and
+are never rewritten or removed.
+
+On `reload`, every line is validated against this shape before the snapshot
+is swapped: the line must be one JSON object with exactly these three
+fields, `version` and `latest` must be genuine integers, the key and both
+versions must exist, and `latest` must itself be a sealed version of the
+key with `1 <= version <= latest`. A missing or extra field, a wrongly
+typed value, a broken JSON line, a record pointing at a key or version
+that never existed, or a binding value above the key's newest sealed
+version makes the whole reload fail with `ValueError`; the in-memory
+snapshot and every record on disk stay untouched. Removing or correcting
+the offending record and reloading again restores the vault, with the
+snapshot matching the disk records one to one.
+
 ### Revocation
 
 Revocation is an explicit marker only. Revoking a version appends one
