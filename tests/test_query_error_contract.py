@@ -72,10 +72,9 @@ NON_INTEGER_VERSIONS = (
 class TestEmptyKeyIdReportedAsValueError(QueryContractTestCase):
     def test_empty_id_with_float_or_bool_version_is_value_error(self):
         vault = self.open_vault()
-        vault.seal("k", b"plain")
-        vault.derive_seal("d", b"pw", b"salt", 100, 16)
-        # The identifier is judged first: a float- or bool-valued version on
-        # an empty id is an identifier problem (ValueError), never TypeError.
+        # The identifier is judged first, before any state is read: a
+        # float- or bool-valued version on an empty id is an identifier
+        # problem (ValueError), never TypeError.
         for bad in (1.0, 2.5, True, False, "1", (1,), _IntLike(1)):
             with self.assertRaises(ValueError, msg=f"derivation {bad!r}"):
                 vault.derivation("", bad)
@@ -84,7 +83,6 @@ class TestEmptyKeyIdReportedAsValueError(QueryContractTestCase):
 
     def test_derivation_without_version_empty_id_still_value_error(self):
         vault = self.open_vault()
-        vault.seal("k", b"plain")
         # Omitting the version is the documented active-version sentinel;
         # the empty id is still checked first and fails with exactly the
         # same ValueError type as an explicit version would.
@@ -97,10 +95,11 @@ class TestEmptyKeyIdReportedAsValueError(QueryContractTestCase):
 
     def test_empty_id_precedence_identical_on_both_queries(self):
         vault = self.open_vault()
-        vault.seal("k", b"plain")
         # Whatever the version argument looks like, both queries classify an
         # empty id the same way; checking the version type first would be
-        # the wrong order.
+        # the wrong order.  Neither half needs a sealed key: the empty-id
+        # ValueError and the non-empty-id TypeError both fire at the entry,
+        # before any key/version lookup.
         versions = (1.0, True, "x", None, 1, -3)
         for version in versions:
             with self.assertRaises(ValueError, msg=f"derivation {version!r}"):

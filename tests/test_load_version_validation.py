@@ -99,9 +99,9 @@ class TestLoadVersionValidation(LoadValidationTestCase):
 
     def test_empty_key_id_value_error_precedes_version_type(self):
         vault = self.open_vault()
-        vault.seal("k", b"m")
-        # The id is checked first: ValueError wins no matter what the
-        # version looks like, including a bad type and the None sentinel.
+        # The id is checked first, before any state is read: ValueError wins
+        # no matter what the version looks like, including a bad type and
+        # the None sentinel.
         for version in (1.0, True, "1", (1,), None, 1):
             with self.assertRaises(ValueError, msg=repr(version)):
                 vault.load("", version)
@@ -269,9 +269,9 @@ class TestPerVersionQueryTypeMatrix(LoadValidationTestCase):
 
     def test_empty_id_value_error_precedes_version_for_every_read(self):
         vault = self.open_vault()
-        vault.seal("k", b"plain")
-        vault.derive_seal("k", b"pw", b"salt", 100, 16)
         # A bad version must not turn the empty-id ValueError into TypeError.
+        # Every call dies at the entry on the empty id, so no key has to
+        # exist for any of these assertions.
         for bad in (1.0, True, "1"):
             with self.assertRaises(ValueError, msg=f"load {bad!r}"):
                 vault.load("", bad)

@@ -456,7 +456,7 @@ class TestRevocationErrors(VaultTestCase):
 
     def test_revoke_empty_key_id_raises_value_error(self):
         vault = self.open_vault()
-        vault.seal("k", b"m")
+        # The id check runs first, before any state is read.
         with self.assertRaises(ValueError):
             vault.revoke("", 1)
 
@@ -732,7 +732,7 @@ class TestSetActive(VaultTestCase):
 
     def test_set_active_empty_key_id_raises_value_error(self):
         vault = self.open_vault()
-        vault.seal("k", b"m")
+        # The id check runs first, before any key/version lookup.
         with self.assertRaises(ValueError):
             vault.set_active("", 1)
 
@@ -1079,9 +1079,8 @@ class TestVersionEntryValidation(VaultTestCase):
 
     def test_load_empty_key_id_value_error_precedes_version_type(self):
         vault = self.open_vault()
-        vault.seal("k", b"m")
-        # Identifier is validated first, so a bad version type on an empty
-        # id is a ValueError, not a TypeError.
+        # Identifier is validated first, before any state is read, so a bad
+        # version type on an empty id is a ValueError, not a TypeError.
         for bad in (1.0, True, "1", (1,), None, 1):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 vault.load("", bad)
