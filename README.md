@@ -95,6 +95,40 @@ material and the revocation journal: a corrupt record or one pointing at a
 key/version that never existed makes the reload fail with `ValueError` while
 the existing snapshot and disk records stay untouched.
 
+#### The activation journal record
+
+Each record in `activations.jsonl` is one line of UTF-8 JSON — one JSON
+object per line, newline-terminated, and the lines appear in exactly the
+order the repoints were appended (file order is append order). A record
+carries exactly three fields:
+
+- `key_id`: the key identifier (a string);
+- `version`: the version the active pointer was repointed at (an integer);
+- `latest`: the binding value — the key's newest sealed version at the
+  moment the record was written (an integer).
+
+Records are serialized with their keys sorted, so repointing key `app` at
+version 1 while its newest sealed version is 2 lands on disk byte-for-byte
+as:
+
+    {"key_id": "app", "latest": 2, "version": 1}
+
+The `latest` field binds the repoint to the newest sealed version at write
+time: the record is honoured only while its `latest` still equals the key's
+newest sealed version. Sealing (or deriving) a higher version afterwards
+makes that new version active again, exactly as if the key had never been
+repointed; the superseded records stay in the journal, untouched, and
+simply no longer apply. A vault that was never repointed has no
+`activations.jsonl` at all — the file is created by the first repoint, and
+from then on records are only ever appended, never rewritten or removed.
+
+On `reload`, every record is re-validated against this shape: a line that
+is not valid JSON, a record with a missing or extra field or a wrongly
+typed one, a record pointing at a key or version that never existed, or a
+`latest` beyond the key's newest sealed version at that point makes the
+whole reload fail with `ValueError`, leaving the in-memory snapshot and
+every disk record untouched.
+
 ### Revocation
 
 Revocation is an explicit marker only. Revoking a version appends one
