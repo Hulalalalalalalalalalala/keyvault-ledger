@@ -209,11 +209,11 @@ class TestRevokedVersionReportsTrue(RevocationStatusTestCase):
 
 
 class TestRevocationStatusSurvivesFullReload(RevocationStatusTestCase):
-    def _build_two_key_state(self) -> Vault:
+    def _build_three_key_state(self) -> Vault:
         vault = self.open_vault()
-        # Plain and derived versions interleaved, markers on a non-active
-        # and an active version, across two keys and with one key left
-        # completely unrevoked.
+        # Plain and derived versions interleaved across three keys:
+        # revocation markers on a non-active and an active version spread
+        # over two of them, the third key left completely unrevoked.
         vault.seal("alpha", b"a1")
         vault.seal("alpha", b"a2")
         vault.revoke("alpha", 1)
@@ -236,7 +236,7 @@ class TestRevocationStatusSurvivesFullReload(RevocationStatusTestCase):
         }
 
     def test_per_version_status_is_verbatim_before_and_after_reload(self):
-        vault = self._build_two_key_state()
+        vault = self._build_three_key_state()
         before = self._all_statuses(vault)
         before_lists = {
             key_id: vault.revoked_versions(key_id)
