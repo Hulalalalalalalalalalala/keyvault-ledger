@@ -1056,6 +1056,98 @@ class TestVersionEntryValidation(VaultTestCase):
         with self.assertRaises(TypeError):
             vault.revoke("never-sealed", True)
 
+    def test_versioned_reads_reject_non_integer_versions(self):
+        vault = self.open_vault()
+        vault.seal("k", b"direct")
+        vault.derive_seal("d", b"pw", b"salt", 100, 16)
+        # 1.0 and True compare equal to the existing version 1, but they are
+        # not genuine ints: a value that merely looks like a version must not
+        # be read as one.  2.0/2.5 match no version at all; either way the
+        # type is rejected before the existence lookup.
+        bad_versions = (1.0, 2.0, 2.5, True, False, "1", (1,), [1])
+        for bad in bad_versions:
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.load("k", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.derivation("d", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.is_revoked("k", bad)
+        # None remains the documented "active version" sentinel for load and
+        # derivation, distinct from the type rejection above.
+        self.assertEqual(vault.load("k", None), b"direct")
+        self.assertEqual(vault.derivation("d", None)["iterations"], 100)
+
+    def test_versioned_reads_reject_non_integer_version_before_key_lookup(self):
+        vault = self.open_vault()
+        # The version type is checked first, so an unknown key with a bad
+        # version is a TypeError, never the KeyError a plain lookup gives.
+        for bad in (1.5, 1.0, True):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.load("never-sealed", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.derivation("never-sealed", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.is_revoked("never-sealed", bad)
+
+    def test_load_empty_key_id_raises_value_error_before_version_check(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        # The key id is validated first: an empty id is a ValueError even
+        # when the version argument would independently be a TypeError.
+        with self.assertRaises(ValueError):
+            vault.load("", 1.0)
+        with self.assertRaises(ValueError):
+            vault.load("", True)
+        with self.assertRaises(ValueError):
+            vault.load("", 1)
+        with self.assertRaises(ValueError):
+            vault.load("")
+
+    def test_rejected_load_leaves_disk_and_snapshot_untouched(self):
+        vault = self.open_vault()
+        materials = {1: b"v1", 2: bytes(range(256)), 3: b"v3"}
+        for payload in materials.values():
+            vault.seal("k", payload)
+
+        def material_files() -> list[str]:
+            return sorted(
+                str(path.relative_to(self.root))
+                for path in (self.root / MATERIALS_DIR).rglob("*")
+                if path.is_file()
+            )
+
+        manifest_before = self.manifest_path().read_bytes()
+        journal_before = self.journal_path().read_bytes()
+        files_before = material_files()
+
+        for bad in (1.0, 2.0, 2.5, True, False, "1", (1,)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.load("k", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.load("never-sealed", bad)
+
+        # A rejected read neither adds nor removes anything on disk...
+        self.assertEqual(self.manifest_path().read_bytes(), manifest_before)
+        self.assertEqual(self.journal_path().read_bytes(), journal_before)
+        self.assertEqual(material_files(), files_before)
+        # ...and the in-memory snapshot is unchanged: the same key stays
+        # readable and every version comes back byte-for-byte identical.
+        self.assertEqual(vault.versions("k"), [1, 2, 3])
+        self.assertEqual(vault.active("k"), 3)
+        for version, payload in materials.items():
+            self.assertEqual(vault.load("k", version), payload)
+        self.assertEqual(vault.load("k"), b"v3")
+
+    def test_load_genuine_integer_versions_keep_key_error_semantics(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        # Real ints that do not exist are still KeyErrors, unchanged.
+        with self.assertRaises(KeyError):
+            vault.load("never-sealed", 1)
+        for bad_version in (0, 2, -1, 99):
+            with self.assertRaises(KeyError, msg=repr(bad_version)):
+                vault.load("k", bad_version)
+
 
 class TestMultiProcess(VaultTestCase):
     def _run_workers(self, workers: list[multiprocessing.Process]) -> None:
