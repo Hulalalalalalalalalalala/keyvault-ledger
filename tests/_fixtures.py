@@ -61,11 +61,46 @@ def cli_env() -> dict[str, str]:
     return env
 
 
+class _NamedTemporaryTree:
+    """A ``TemporaryDirectory``-shaped tree rooted at a caller-chosen path.
+
+    It exposes only the surface :meth:`VaultFixture._cleanup` uses -- a
+    ``name`` and a ``cleanup`` that removes the tree -- so a case that needs
+    its simulated errors to name a fixed, repeatable directory can hand the
+    fixture a stable path inside a real temporary parent instead of the
+    randomly named tree ``tempfile.TemporaryDirectory`` mints.  The parent is
+    itself an ordinary temporary directory, so everything still lives under
+    the system temporary root and nothing escapes it.
+    """
+
+    def __init__(self, path: Path) -> None:
+        path.mkdir(parents=True, exist_ok=False)
+        self.name = str(path)
+
+    def cleanup(self) -> None:
+        # Propagate like ``TemporaryDirectory.cleanup`` (which runs with
+        # ``ignore_cleanup_errors=False`` by default): the single exit relies
+        # on an OSError here to enter its one recovery pass.  Cases that
+        # inject a failing remover restore it and delete the tree themselves.
+        shutil.rmtree(self.name)
+
+
 class VaultFixture:
     """One per test case: temporary space, handles and workers, one exit."""
 
-    def __init__(self, test_case: unittest.TestCase) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
+    def __init__(
+        self,
+        test_case: unittest.TestCase,
+        *,
+        tmp_path: Path | None = None,
+    ) -> None:
+        if tmp_path is None:
+            self._tmp = tempfile.TemporaryDirectory()
+        else:
+            # A caller-named tree: the path itself is fixed (so simulated
+            # errors can name it byte-for-byte) while its parent stays a
+            # real system temporary directory.
+            self._tmp = _NamedTemporaryTree(tmp_path)
         self.tmp_path = Path(self._tmp.name)
         # The conventional vault root of this case; cases that need several
         # independent vaults use :meth:`path`.
@@ -223,8 +258,11 @@ class VaultFixture:
 
         if handle_error is not None:
             if removal_error is not None:
-                # Both steps failed yet the tree is gone (a racing remover
-                # finished it): keep both failures visible, neither dropped.
+                # Both steps failed yet the tree was already cleared before
+                # the exit reports (there is no surviving tree to name):
+                # keep both step failures visible, the handle failure
+                # chained as the direct cause of the removal failure,
+                # neither dropped nor rewritten.
                 raise removal_error from handle_error
             raise handle_error
         if removal_error is not None:
