@@ -799,14 +799,22 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         )
         vault = fixture.open()
         vault.seal("k", b"m")
+        # Really return the handle first (an ordinary, idempotent call), so
+        # the staged close failure below is the only thing the one exit ever
+        # sees of the handle step.  No genuinely open lock file is left for
+        # the real removal to delete -- deleting a file still held open is
+        # something only Unix-like semantics allow -- so the healthy removal
+        # plays out identically on every platform and the staged failure
+        # strands neither a busy lock file nor the tree that holds it.
+        vault.close()
         with mock.patch.object(
             vault, "close", side_effect=RuntimeError("simulated close failure")
         ):
             with self.assertRaises(RuntimeError) as caught:
                 fixture._cleanup()
         self.assertEqual(str(caught.exception), "simulated close failure")
-        # The simulated failure skipped the real handle return; the mock is
-        # gone now, so close for real and leave no unclosed lock handle
+        # The handle was already really returned above; this is the
+        # idempotent no-op that guarantees no unclosed lock handle survives
         # (which would surface as a ResourceWarning at interpreter shutdown).
         vault.close()
         # The directory step still ran before the handle error was raised.
