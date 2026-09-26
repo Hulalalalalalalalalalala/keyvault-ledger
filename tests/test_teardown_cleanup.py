@@ -21,9 +21,10 @@ this module pins the *test-side* cleanup contract only:
   (the tree emptied for real, both steps forced to fail, the exit's two
   existence decisions staged -- no racing thread and no reliance on the
   platform's open-file deletion semantics) the removal error is reported
-  verbatim, byte-for-byte against a stable text that names a fixed
-  directory, and the handle error is chained as its direct cause carrying
-  its own original traceback, the two errors intact, neither swallowing nor
+  verbatim, byte-for-byte against a text that names the full path of the
+  fixed-named directory inside its per-case unique parent directory, and
+  the handle error is chained as its direct cause carrying its own
+  original traceback, the two errors intact, neither swallowing nor
   rewriting the other;
   a handle failure with a healthy removal is reported on its own, and a
   removal failure with healthy handles names only the directory;
@@ -124,7 +125,10 @@ def _tracebacks(result: unittest.TestResult) -> list[str]:
 
 
 # Every temporary path touched by a simulated case, so the driving tests can
-# prove none of them survives (including the forced-failure ones).
+# prove none of them survives (including the forced-failure ones).  For the
+# double-failure simulation this is the per-case unique parent directory
+# that holds the fixed-named tree, itself a direct child of the temporary
+# root.
 _SIMULATED_PATHS: list[Path] = []
 
 
@@ -206,33 +210,49 @@ def _force_handle_and_removal_failure(
 
 # Stable, platform-independent simulation of the single exit's last branch:
 # the temporary tree has already been cleared, and returning the lock handle
-# and deleting the tree both fail.  The texts are fixed literals (the
-# directory they name is a fixed leaf inside a real system-temporary parent,
-# never a randomly minted path), so repeated runs produce byte-identical
-# output; nothing depends on a platform's open-file deletion semantics.
+# and deleting the tree both fail.  The tree keeps one fixed leaf name, but
+# the leaf now lives inside a per-case unique parent directory minted under
+# the system temporary root, so the same leaf name never collides with
+# another case or with debris from an earlier run (concurrent runs
+# included).  The simulated removal error names the full directory path --
+# unique parent and fixed leaf together -- and the verbatim comparison text
+# is built from the real path at runtime, so it carries the complete
+# directory name rather than the bare leaf.
 _DOUBLE_FAILURE_TREE_NAME = "teardown-double-failure-tree"
 _SIMULATED_CLOSE_TEXT = (
     "SIMULATED-CLOSE-FAILURE-MARKER: lock handle was not returned"
 )
-_SIMULATED_REMOVAL_TEXT = (
-    "SIMULATED-REMOVAL-FAILURE-MARKER: could not delete temporary "
-    f"directory {_DOUBLE_FAILURE_TREE_NAME!r}"
-)
 
 
-def _double_failure_tree_path() -> Path:
-    """Return the fixed-named leaf used for the double-failure simulation.
+def _simulated_removal_text(tree_path: Path) -> str:
+    """The removal-failure text for ``tree_path``, naming the full
+    directory path -- never just the fixed leaf name."""
+    return (
+        "SIMULATED-REMOVAL-FAILURE-MARKER: could not delete temporary "
+        f"directory {str(tree_path)!r}"
+    )
 
-    It is a direct child of the resolved system temporary root, so every
-    simulated path still lives inside that root (and its parent is the
-    temporary root exactly, as the order-independence cases require), yet
-    the leaf always carries the same name.  The simulated removal error
-    names only this fixed leaf, never the machine-specific temporary root,
-    so the error text is byte-stable run after run on every platform; the
-    case's own recovery always removes the leaf, so a fixed name leaves no
-    debris.
+
+# The removal text of each driven double-failure case, in creation order, so
+# the driving tests can compare the reported error verbatim even though the
+# per-case unique parent makes the exact text differ from run to run.
+_SIMULATED_REMOVAL_TEXTS: list[str] = []
+
+
+def _double_failure_tree_paths() -> tuple[Path, Path]:
+    """Create this case's unique parent directory and return it together
+    with the fixed-named tree path inside it.
+
+    The parent is freshly minted under the resolved system temporary root
+    for every case, so it is a direct child of that root exactly (as the
+    order-independence cases require) and two cases -- or two runs, even
+    concurrent ones -- never share it, while the leaf always carries the
+    same fixed name.  The simulated removal error names the leaf's full
+    path, unique parent included; the case's own recovery always removes
+    the whole parent, so a fixed leaf name leaves no debris.
     """
-    return Path(tempfile.gettempdir()).resolve() / _DOUBLE_FAILURE_TREE_NAME
+    parent = Path(tempfile.mkdtemp()).resolve()
+    return parent, parent / _DOUBLE_FAILURE_TREE_NAME
 
 
 def _double_failure_branch_patches(
@@ -253,9 +273,9 @@ def _double_failure_branch_patches(
       complete with its genuine traceback -- never a string pasted into the
       removal message;
 
-    * the remover fails with one fixed, verbatim text (naming the fixed
-      directory) on every call against this tree, while every other path
-      keeps using the real remover untouched;
+    * the remover fails with one fixed, verbatim text (naming the tree's
+      full directory path) on every call against this tree, while every
+      other path keeps using the real remover untouched;
 
     * ``Path.exists`` is staged only for this tree: its first call (the
       inner check right after the recovery retry) reports the tree present
@@ -276,8 +296,9 @@ def _double_failure_branch_patches(
             return real_rmtree(path, *args, **kwargs)
         state["rmtree_calls"] += 1
         # The tree was already emptied in setup; every removal the exit
-        # attempts against it fails with one fixed, verbatim text.
-        raise OSError(_SIMULATED_REMOVAL_TEXT)
+        # attempts against it fails with one fixed, verbatim text naming
+        # the tree's full directory path.
+        raise OSError(_simulated_removal_text(fixture.tmp_path))
 
     def staged_exists(self_):
         if self_ != fixture.tmp_path:
@@ -335,12 +356,14 @@ def _force_handle_and_removal_failure_tree_cleared(
     Same recovery contract as the other forced-failure helpers: the
     recovery cleanup is registered *before* the fixture is built, so LIFO
     ordering runs the failing exit first while the patches are live and
-    only afterwards restores close/remover and removes the (already empty)
-    tree, leaving nothing behind.
+    only afterwards restores close/remover and removes the case's unique
+    parent directory (the fixed-named tree inside it was already emptied),
+    leaving nothing behind.
     """
     fixture_holder: list[VaultFixture] = []
     vault_holder: list[Vault] = []
     patcher_holder: list = []
+    parent_holder: list[Path] = []
 
     def recover() -> None:
         for patcher in reversed(patcher_holder):
@@ -350,17 +373,19 @@ def _force_handle_and_removal_failure_tree_cleared(
         # so no unclosed lock ever reaches interpreter shutdown.
         for vault in vault_holder:
             vault.close()
-        if fixture_holder:
-            shutil.rmtree(fixture_holder[0].tmp_path, ignore_errors=True)
+        if parent_holder:
+            shutil.rmtree(parent_holder[0], ignore_errors=True)
 
     # Registered FIRST, so LIFO runs the (failing) fixture cleanup while
     # the patches are still live and only then runs this recovery.
     test_case.addCleanup(recover)
-    fixture = VaultFixture(
-        test_case, tmp_path=_double_failure_tree_path()
-    )
+    parent, tree_path = _double_failure_tree_paths()
+    parent_holder.append(parent)
+    fixture = VaultFixture(test_case, tmp_path=tree_path)
     fixture_holder.append(fixture)
-    _SIMULATED_PATHS.append(fixture.tmp_path)
+    # The unique parent is the direct child of the temporary root; the
+    # fixed-named leaf travels inside it.
+    _SIMULATED_PATHS.append(parent)
     vault = fixture.open()
     vault_holder.append(vault)
     # Genuine work on a genuine vault before the state is staged.
@@ -370,6 +395,7 @@ def _force_handle_and_removal_failure_tree_cleared(
     patcher_holder.extend(patchers)
     for patcher in patchers:
         patcher.start()
+    _SIMULATED_REMOVAL_TEXTS.append(_simulated_removal_text(fixture.tmp_path))
     return fixture, vault
 
 
@@ -692,17 +718,16 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
     def test_both_failures_survive_when_the_tree_was_already_cleared(self):
         # The last branch of the one teardown exit, reached through a
         # controllable, platform-independent simulation: the temporary
-        # tree is emptied for real, after which returning the lock handle
-        # and deleting the tree are both forced to fail and the exit's two
-        # existence decisions are staged.  The exit reports the removal
-        # error verbatim with the handle error chained as its direct cause
-        # and carrying its own traceback: both survive intact.
-        fixture = VaultFixture(
-            unittest.TestCase(), tmp_path=_double_failure_tree_path()
-        )
-        self.addCleanup(
-            lambda: shutil.rmtree(fixture.tmp_path, ignore_errors=True)
-        )
+        # tree -- a fixed-named leaf inside this case's own unique parent
+        # directory under the temporary root -- is emptied for real, after
+        # which returning the lock handle and deleting the tree are both
+        # forced to fail and the exit's two existence decisions are
+        # staged.  The exit reports the removal error verbatim (naming the
+        # full directory path) with the handle error chained as its direct
+        # cause and carrying its own traceback: both survive intact.
+        parent, tree_path = _double_failure_tree_paths()
+        self.addCleanup(lambda: shutil.rmtree(parent, ignore_errors=True))
+        fixture = VaultFixture(unittest.TestCase(), tmp_path=tree_path)
         vault = fixture.open()
         vault.seal("k", b"m")
         lock_path = fixture.root / "vault.lock"
@@ -731,15 +756,18 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         self.assertEqual(state["exists_calls"], 2)
         # The removal failure is reported VERBATIM, byte-for-byte: it is not
         # the tree-survived AssertionError, is not rewritten into the handle
-        # error, and is compared against the whole fixed text rather than a
-        # substring of it.
+        # error, and is compared as a whole text -- one that names the full
+        # directory path, unique parent and fixed leaf together -- rather
+        # than a substring of it.
+        removal_text = _simulated_removal_text(fixture.tmp_path)
         self.assertNotIsInstance(caught.exception, AssertionError)
-        self.assertEqual(str(caught.exception), _SIMULATED_REMOVAL_TEXT)
+        self.assertEqual(str(caught.exception), removal_text)
         self.assertEqual(
             str(caught.exception),
             "SIMULATED-REMOVAL-FAILURE-MARKER: could not delete temporary "
-            "directory 'teardown-double-failure-tree'",
+            f"directory {str(fixture.tmp_path)!r}",
         )
+        self.assertIn(_DOUBLE_FAILURE_TREE_NAME, str(caught.exception))
         self.assertNotIn(_SIMULATED_CLOSE_TEXT, str(caught.exception))
         # ... and the handle failure survives intact as the chained direct
         # cause, verbatim and WITH ITS OWN ORIGINAL TRACEBACK -- the stack
@@ -748,7 +776,7 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         cause = caught.exception.__cause__
         self.assertIsInstance(cause, RuntimeError)
         self.assertEqual(str(cause), _SIMULATED_CLOSE_TEXT)
-        self.assertNotIn(_SIMULATED_REMOVAL_TEXT, str(cause))
+        self.assertNotIn(removal_text, str(cause))
         self.assertIsNotNone(cause.__traceback__)
         cause_frames = traceback.extract_tb(cause.__traceback__)
         self.assertTrue(cause_frames)
@@ -872,6 +900,7 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         # neither swallowing the other and neither rewritten into the
         # surviving-directory complaint.
         _SIMULATED_PATHS.clear()
+        _SIMULATED_REMOVAL_TEXTS.clear()
         result = _run(
             unittest.TestSuite(
                 [_SimAssertThenHandleAndRemovalFailTreeCleared("test_body")]
@@ -882,6 +911,13 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         original = [
             tb for tb in tracebacks if "ORIGINAL-ASSERTION-MARKER" in tb
         ]
+        # The driven case staged exactly one double failure, and the exact
+        # removal text -- naming the full directory path of that case's own
+        # fixed-named tree inside its unique parent -- was recorded for the
+        # verbatim comparisons below.
+        self.assertEqual(len(_SIMULATED_REMOVAL_TEXTS), 1)
+        removal_text = _SIMULATED_REMOVAL_TEXTS[0]
+        self.assertIn(_DOUBLE_FAILURE_TREE_NAME, removal_text)
         # Exactly one primary failure: the case's own assertion, verbatim,
         # carrying neither teardown complaint.
         self.assertEqual(len(original), 1)
@@ -892,7 +928,7 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         self.assertIn("False is not true : ORIGINAL-ASSERTION-MARKER", original[0])
         self.assertNotIn("teardown could not delete", original[0])
         self.assertNotIn(_SIMULATED_CLOSE_TEXT, original[0])
-        self.assertNotIn(_SIMULATED_REMOVAL_TEXT, original[0])
+        self.assertNotIn(removal_text, original[0])
 
         # Exactly one teardown error that keeps BOTH step failures intact:
         # the removal error is the reported exception and the handle error
@@ -901,15 +937,15 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         combined = [
             tb
             for tb in tracebacks
-            if _SIMULATED_REMOVAL_TEXT in tb or _SIMULATED_CLOSE_TEXT in tb
+            if removal_text in tb or _SIMULATED_CLOSE_TEXT in tb
         ]
         self.assertEqual(len(combined), 1)
         self.assertNotIn("ORIGINAL-ASSERTION-MARKER", combined[0])
         self.assertNotIn("teardown could not delete", combined[0])
-        # The removal error is rendered VERBATIM -- the whole fixed text on
-        # the OSError line, not a fragment matched by containment -- and
-        # names the fixed directory.
-        self.assertIn(f"OSError: {_SIMULATED_REMOVAL_TEXT}", combined[0])
+        # The removal error is rendered VERBATIM -- the whole text on the
+        # OSError line, full directory path included, not a fragment
+        # matched by containment.
+        self.assertIn(f"OSError: {removal_text}", combined[0])
         self.assertIn("OSError", combined[0])
         # The handle error is the chained direct cause and, crucially,
         # carries its own original traceback: the stack runs through the
