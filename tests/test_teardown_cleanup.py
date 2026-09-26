@@ -16,9 +16,13 @@ this module pins the *test-side* cleanup contract only:
 * when returning a lock handle and deleting the tree both fail, the handle
   failure is surfaced together with the removal failure -- named in the
   message and chained as its cause -- instead of being swallowed by it;
-  this holds even when a racing remover deletes the tree between the
-  teardown's existence checks: the removal error is then reported verbatim
-  with the handle error chained as its direct cause, both intact;
+  this also holds for the exit's last branch, where the temporary tree has
+  already been cleared before teardown reports: both removal attempts fail
+  with one fixed error text while the tree's "already gone" state is staged
+  as a controllable simulation that deletes nothing on disk (so it reproduces
+  identically on every platform, including ones that refuse to delete a file
+  a still-open handle points at).  The removal error is then reported
+  verbatim with the handle error chained as its direct cause, both intact;
   a handle failure with a healthy removal is reported on its own, and a
   removal failure with healthy handles names only the directory;
 
@@ -110,6 +114,19 @@ def _tracebacks(result: unittest.TestResult) -> list[str]:
     return [tb for _, tb in result.failures + result.errors]
 
 
+def _traceback_frames(tb) -> list[str]:
+    """Return the function names on a real exception traceback chain.
+
+    Used to prove a reported error carries the genuine raised stack through
+    the single teardown exit rather than a flattened piece of prose.
+    """
+    names: list[str] = []
+    while tb is not None:
+        names.append(tb.tb_frame.f_code.co_name)
+        tb = tb.tb_next
+    return names
+
+
 # ---------------------------------------------------------------------------
 # small simulated cases (kept out of discovery via load_tests below; they are
 # only ever run through the explicit suites in this module)
@@ -197,43 +214,75 @@ def _force_handle_and_removal_failure(
     return fixture, vault
 
 
+# Stable text for the controllable "tree already cleared" simulation.  The
+# removal failure is always built from this one fixed marker and the exact
+# path it was asked to remove, so every attempt at the same tree reports one
+# identical string -- nothing timing- or platform-dependent creeps in.
+_SIM_REMOVAL_TREE_GONE_MARKER = "SIMULATED-REMOVAL-TREE-GONE-MARKER"
+_SIM_CLOSE_MARKER = "SIMULATED-CLOSE-MARKER"
+
+
+def _simulated_tree_gone_removal_error(path) -> OSError:
+    """The one fixed removal error text used by the tree-gone simulation."""
+    return OSError(f"{_SIM_REMOVAL_TREE_GONE_MARKER}: {path}")
+
+
 def _tree_gone_branch_patches(
     fixture: VaultFixture, vault: Vault
 ) -> tuple[list, dict]:
     """Build (unstarted) patchers that drive the one exit to its last
-    branch -- the handle return and the removal both fail while a racing
-    remover deletes the tree in the gap between the exit's two post-retry
-    existence checks -- together with the call-state the tests assert on.
+    branch -- the handle return and the removal both fail while the tree is
+    already cleared before the exit reports -- together with the call-state
+    the tests assert on.
+
+    This is a controllable simulation that deletes nothing on disk and never
+    unlinks a file the still-open lock handle points at, so the very same
+    state reproduces identically on every platform, including systems whose
+    removal semantics refuse to delete an open file.  Only the exit's *view*
+    of the tree is staged, while the exit itself runs verbatim.
 
     The single exit keeps a removal error only while the tree still exists
     after the recovery retry (its inner check) and re-checks existence
     once before reporting.  The branch is reached precisely when the tree
-    is present at the inner check -- so neither error is discarded -- and
-    already gone at the outer one, with the handle error still in hand.
-    The view is staged deterministically while the exit itself runs
-    verbatim:
+    reads as present at the inner check -- so neither error is discarded --
+    and as already cleared at the outer one, with the handle error still in
+    hand:
 
     * the first two ``shutil.rmtree`` calls against this tree --
       ``TemporaryDirectory.cleanup`` and the exit's own recovery retry --
-      both fail and leave the tree on disk, exactly the two attempts the
-      real exit makes;
+      both fail with one fixed error text and remove nothing, exactly the
+      two attempts the real exit makes; every later call (the driving
+      test's safety net included) reaches the real remover untouched;
 
     * ``Path.exists`` is staged only for this tree: its first call (the
       inner check) reports the tree present, and its second (the outer
-      check) removes the tree for real and then reports it gone -- the
-      racing remover winning the gap.  Every other ``exists`` call is left
-      untouched;
+      check) reports the tree already cleared.  Neither call touches the
+      filesystem -- the "already cleared" state is a view, not a deletion;
+      every other ``exists`` call is left untouched;
 
     * ``Vault.close`` fails throughout, so the lock handle never comes
-      back during the exit even though the workers were drained first and
-      the lock file never obstructed the real deletion.
+      back during the exit even though the workers were drained first.
 
-    The captured remover/existence functions are the originals, so the
-    racer's deletion really goes to the filesystem.
+    The tree therefore physically stays on disk throughout the case -- the
+    open lock handle is never removed out from under itself -- and the
+    driving helper's ordinary recovery stops the patches, returns the
+    handle for real and deletes the tree for real, leaving no debris on
+    any platform.
     """
     real_rmtree = shutil.rmtree
     real_exists = Path.exists
-    state = {"rmtree_calls": 0, "exists_calls": 0}
+    # ``removal_errors`` keeps the exact OSError objects the two failed
+    # attempts raised (the recovery retry's object is the one the exit
+    # ultimately re-raises); ``close_error`` is the single handle error
+    # object repeated on every close call and chained as the direct cause.
+    # The tests assert identity, not just text, so neither error may be
+    # rebuilt or flattened into prose.
+    state = {
+        "rmtree_calls": 0,
+        "exists_calls": 0,
+        "removal_errors": [],
+        "close_error": RuntimeError(_SIM_CLOSE_MARKER),
+    }
 
     def staged_rmtree(path, *args, **kwargs):
         if Path(path) != fixture.tmp_path:
@@ -243,8 +292,15 @@ def _tree_gone_branch_patches(
         state["rmtree_calls"] += 1
         if state["rmtree_calls"] <= 2:
             # Attempt 1 (TemporaryDirectory.cleanup) and attempt 2 (the
-            # single exit's recovery retry) both fail and leave the tree.
-            raise OSError(f"SIMULATED-REMOVAL-TREE-GONE-MARKER: {path}")
+            # single exit's recovery retry) both fail with one fixed text
+            # and delete nothing.  Each keeps its own raised OSError object
+            # (the exit retains and re-raises the retry's), while the
+            # "tree already cleared" state is staged by ``staged_exists``
+            # alone, so nothing on disk -- and in particular no file behind
+            # the still-open lock handle -- is ever unlinked.
+            exc = _simulated_tree_gone_removal_error(path)
+            state["removal_errors"].append(exc)
+            raise exc
         return real_rmtree(path, *args, **kwargs)
 
     def staged_exists(self_):
@@ -256,15 +312,16 @@ def _tree_gone_branch_patches(
             # is still there, so the removal error is retained.
             return True
         if state["exists_calls"] == 2:
-            # Outer reporting check: the racing remover finishes the
-            # deletion for real in the gap, so the tree is already gone.
-            real_rmtree(fixture.tmp_path)
+            # Outer reporting check: present the tree as already cleared
+            # -- the state a concurrent remover would otherwise have to
+            # produce -- without deleting anything.  The view alone is
+            # platform-independent.
             return False
         return real_exists(self_)
 
     patchers = [
         mock.patch.object(
-            vault, "close", side_effect=RuntimeError("SIMULATED-CLOSE-MARKER")
+            vault, "close", side_effect=state["close_error"]
         ),
         mock.patch.object(shutil, "rmtree", side_effect=staged_rmtree),
         # A plain function (not a MagicMock) replaces the unbound method, so
@@ -279,15 +336,17 @@ def _force_handle_and_removal_failure_tree_gone(
     test_case: unittest.TestCase,
 ) -> tuple[VaultFixture, Vault]:
     """Give ``test_case`` a fixture whose handle return and removal both
-    fail while a racing remover still deletes the tree before the exit
-    reports -- the one exit's last branch.
+    fail while the single exit sees the tree as already cleared before it
+    reports -- the one exit's last branch, staged as a controllable
+    simulation that deletes nothing on disk.
 
     Same recovery contract as the other forced-failure helpers: the
     recovery cleanup is registered *before* the fixture is built, so LIFO
     ordering runs the failing exit first while the patches are live and
     only afterwards restores close/remover, returns the handle for real
-    (so no unclosed lock file survives) and runs an ignore_errors safety
-    net over the tree the racer already deleted.  Nothing is left behind.
+    (so no unclosed lock file survives) and deletes the tree for real --
+    the simulation itself only staged the "already cleared" view and left
+    the whole tree on disk.  Nothing is left behind on any platform.
     """
     fixture_holder: list[VaultFixture] = []
     vault_holder: list[Vault] = []
@@ -301,7 +360,9 @@ def _force_handle_and_removal_failure_tree_gone(
         for vault in vault_holder:
             vault.close()
         if fixture_holder:
-            # The racer already deleted the tree; this is a harmless net.
+            # The simulation deleted nothing: the whole tree is still on
+            # disk (the open lock handle was never unlinked).  Remove it
+            # for real now with the restored remover.
             shutil.rmtree(fixture_holder[0].tmp_path, ignore_errors=True)
 
     # Registered FIRST, so LIFO runs the (failing) fixture cleanup while
@@ -351,11 +412,13 @@ class _SimAssertThenHandleAndCleanupFail(unittest.TestCase):
 
 class _SimAssertThenHandleFailAndRemovalFailTreeGone(unittest.TestCase):
     """The case fails an assertion; the one teardown then fails to return
-    the lock handle AND fails both removal attempts, but a racing remover
-    deletes the tree before teardown reports.  The original assertion must
-    remain the verbatim primary failure while the teardown surfaces *both*
-    of its own errors -- the removal error with the handle error chained
-    as its cause -- neither swallowing nor rewriting the other."""
+    the lock handle AND fails both removal attempts, while the temporary
+    tree is presented as already cleared before teardown reports (a
+    platform-independent simulation that deletes nothing on disk).  The
+    original assertion must remain the verbatim primary failure while the
+    teardown surfaces *both* of its own errors -- the removal error with
+    the handle error chained as its cause -- neither swallowing nor
+    rewriting the other."""
 
     def test_body(self) -> None:
         _fixture, vault = _force_handle_and_removal_failure_tree_gone(self)
@@ -633,12 +696,14 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         # removes it for real after this case.
         self.assertTrue(fixture.tmp_path.exists())
 
-    def test_both_failures_survive_when_a_racer_deletes_the_tree_first(self):
+    def test_both_failures_survive_when_the_tree_is_already_cleared(self):
         # The last branch of the one teardown exit: the handle return and
-        # both removal attempts fail, but a racing remover deletes the tree
-        # in the gap between the exit's inner and outer existence checks.
-        # The exit then reports the removal error with the handle error
-        # chained as its direct cause: both survive verbatim.
+        # both removal attempts fail, and the exit's final existence check
+        # presents the tree as already cleared (a controllable simulation
+        # that deletes nothing on disk, so it reproduces on every platform).
+        # The exit then reports the original removal error verbatim with
+        # the original handle error chained as its direct cause: neither is
+        # rebuilt, flattened into text, nor swallowed by the other.
         fixture = VaultFixture(unittest.TestCase())
         self.addCleanup(
             lambda: shutil.rmtree(fixture.tmp_path, ignore_errors=True)
@@ -650,9 +715,23 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         patchers, state = _tree_gone_branch_patches(fixture, vault)
         for patcher in patchers:
             patcher.start()
+        # A plain try/except (not ``assertRaises``): the latter calls
+        # ``with_traceback(None)`` on the caught object in its ``__exit__``,
+        # stripping exactly the genuine raised stack this case must inspect.
+        caught: OSError | None = None
+        removal_frames: list[str] = []
+        cause_frames: list[str] = []
+        cause = None
         try:
-            with self.assertRaises(OSError) as caught:
-                fixture._cleanup()
+            fixture._cleanup()
+        except OSError as exc:
+            caught = exc
+            # Capture the real stacks while still inside the handler, before
+            # anything can clear them.
+            removal_frames = _traceback_frames(exc.__traceback__)
+            cause = exc.__cause__
+            if cause is not None:
+                cause_frames = _traceback_frames(cause.__traceback__)
         finally:
             for patcher in reversed(patchers):
                 patcher.stop()
@@ -660,31 +739,54 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
             # now so no unclosed lock handle reaches interpreter shutdown.
             vault.close()
 
+        if caught is None:
+            self.fail("teardown did not raise")
+
         # Both removal attempts really ran, and the exit consulted
-        # existence exactly twice -- once to keep the error, once to find
-        # the racer had already finished the deletion.
+        # existence exactly twice -- once to keep the error, once to see
+        # the tree presented as already cleared.
         self.assertEqual(state["rmtree_calls"], 2)
         self.assertEqual(state["exists_calls"], 2)
-        # The removal failure is reported verbatim: it is not the
-        # tree-survived AssertionError and is not rewritten into the
-        # handle error.
-        self.assertNotIsInstance(caught.exception, AssertionError)
-        self.assertIn("SIMULATED-REMOVAL-TREE-GONE-MARKER", str(caught.exception))
-        self.assertNotIn("SIMULATED-CLOSE-MARKER", str(caught.exception))
-        # ... and the handle failure survives intact as the chained direct
-        # cause, neither swallowing nor swallowed by the removal failure.
-        cause = caught.exception.__cause__
-        self.assertIsInstance(cause, RuntimeError)
-        self.assertEqual(str(cause), "SIMULATED-CLOSE-MARKER")
-        self.assertNotIn(
-            "SIMULATED-REMOVAL-TREE-GONE-MARKER", str(cause)
+
+        # The simulation only staged a view: the tree was never removed on
+        # disk (nothing behind the still-open lock handle was ever
+        # unlinked, which is what makes the branch platform-independent).
+        self.assertTrue(lock_path.exists())
+        self.assertTrue(fixture.root.exists())
+        self.assertTrue(fixture.tmp_path.exists())
+
+        # The two failed removal attempts carry one fixed, identical text;
+        # repeating the simulation yields exactly the same string.
+        removal_errors = state["removal_errors"]
+        self.assertEqual(len(removal_errors), 2)
+        expected_removal_text = str(
+            _simulated_tree_gone_removal_error(fixture.tmp_path)
         )
-        # The racer really removed the whole tree, lock file included; the
-        # still-open lock handle did not obstruct deletion, and nothing is
-        # left behind for the safety net to find.
-        self.assertFalse(lock_path.exists())
-        self.assertFalse(fixture.root.exists())
-        self.assertFalse(fixture.tmp_path.exists())
+        self.assertEqual(str(removal_errors[0]), str(removal_errors[1]))
+        self.assertEqual(str(removal_errors[0]), expected_removal_text)
+
+        # The removal failure is reported verbatim: it is the original
+        # OSError object from the recovery retry, not the tree-survived
+        # AssertionError and not a freshly built or rewritten error.
+        self.assertIs(caught, removal_errors[1])
+        self.assertNotIsInstance(caught, AssertionError)
+        self.assertEqual(str(caught), expected_removal_text)
+        self.assertNotIn(_SIM_CLOSE_MARKER, str(caught))
+        # Its traceback is the real raised stack through the single exit,
+        # not a paragraph of concatenated prose.
+        self.assertIn("_cleanup", removal_frames)
+        self.assertIn("staged_rmtree", removal_frames)
+
+        # The original handle exception survives intact as the chained
+        # direct cause: the very object close raised (stack included),
+        # neither swallowing nor swallowed by the removal failure.
+        self.assertIs(cause, state["close_error"])
+        self.assertIsInstance(cause, RuntimeError)
+        self.assertEqual(str(cause), _SIM_CLOSE_MARKER)
+        self.assertNotIn(_SIM_REMOVAL_TREE_GONE_MARKER, str(cause))
+        # The cause keeps its own real raised stack, captured where close
+        # failed inside the single exit.
+        self.assertIn("_cleanup", cause_frames)
 
     def test_close_handle_error_is_surfaced_not_swallowed(self):
         fixture = VaultFixture(unittest.TestCase())
@@ -784,12 +886,14 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         self,
     ):
         # The last branch of the one teardown exit: the handle return and
-        # both removal attempts fail, but a racing remover deletes the tree
-        # before teardown reports.  The case's own assertion is still the
-        # verbatim primary failure, and the teardown separately surfaces
+        # both removal attempts fail, and the exit's final check presents
+        # the tree as already cleared (a platform-independent simulation
+        # that deletes nothing on disk).  The case's own assertion is still
+        # the verbatim primary failure, and the teardown separately surfaces
         # BOTH of its errors -- the removal error with the handle error
-        # chained as its cause -- neither swallowing the other and neither
-        # rewritten into the surviving-directory complaint.
+        # chained as its cause -- neither swallowing the other, neither
+        # rewritten into the surviving-directory complaint, and both
+        # carrying their genuine raised stacks through the single exit.
         _SIMULATED_PATHS.clear()
         result = _run(
             unittest.TestSuite(
@@ -810,33 +914,55 @@ class TestTeardownFailureSurfaced(unittest.TestCase):
         )
         self.assertIn("False is not true : ORIGINAL-ASSERTION-MARKER", original[0])
         self.assertNotIn("teardown could not delete", original[0])
-        self.assertNotIn("SIMULATED-CLOSE-MARKER", original[0])
-        self.assertNotIn("SIMULATED-REMOVAL-TREE-GONE-MARKER", original[0])
+        self.assertNotIn(_SIM_CLOSE_MARKER, original[0])
+        self.assertNotIn(_SIM_REMOVAL_TREE_GONE_MARKER, original[0])
 
         # Exactly one teardown error that keeps BOTH step failures intact:
         # the removal error is the reported exception and the handle error
         # is its chained direct cause.  It is not the tree-survived
-        # complaint, because the racer had already removed the tree.
+        # complaint, because the final check presented the tree as cleared.
         combined = [
             tb
             for tb in tracebacks
-            if "SIMULATED-REMOVAL-TREE-GONE-MARKER" in tb
-            or "SIMULATED-CLOSE-MARKER" in tb
+            if _SIM_REMOVAL_TREE_GONE_MARKER in tb
+            or _SIM_CLOSE_MARKER in tb
         ]
         self.assertEqual(len(combined), 1)
-        self.assertNotIn("ORIGINAL-ASSERTION-MARKER", combined[0])
-        self.assertNotIn("teardown could not delete", combined[0])
-        self.assertIn("SIMULATED-REMOVAL-TREE-GONE-MARKER", combined[0])
-        self.assertIn("OSError", combined[0])
-        self.assertIn("SIMULATED-CLOSE-MARKER", combined[0])
-        self.assertIn("RuntimeError", combined[0])
-        self.assertIn("direct cause", combined[0])
+        teardown_tb = combined[0]
+        self.assertNotIn("ORIGINAL-ASSERTION-MARKER", teardown_tb)
+        self.assertNotIn("teardown could not delete", teardown_tb)
+        # Both errors are rendered with their real raised stacks (one each)
+        # and the explicit cause chain through the single exit -- not
+        # flattened into a single concatenated paragraph.
+        self.assertGreaterEqual(
+            teardown_tb.count("Traceback (most recent call last):"), 2
+        )
+        self.assertIn(
+            "The above exception was the direct cause of the following "
+            "exception:",
+            teardown_tb,
+        )
+        self.assertIn("_fixtures.py", teardown_tb)
+        self.assertIn("raise removal_error from handle_error", teardown_tb)
+        self.assertIn("vault.close()", teardown_tb)
+        # The removal error's fixed opening text is rendered verbatim.
+        self.assertIn(
+            f"OSError: {_SIM_REMOVAL_TREE_GONE_MARKER}:", teardown_tb
+        )
+        # The handle error is the cause: same type, same verbatim text.
+        self.assertIn(f"RuntimeError: {_SIM_CLOSE_MARKER}", teardown_tb)
+        # The cause (handle) section comes before the reported removal.
+        self.assertLess(
+            teardown_tb.index(f"RuntimeError: {_SIM_CLOSE_MARKER}"),
+            teardown_tb.index(f"OSError: {_SIM_REMOVAL_TREE_GONE_MARKER}:"),
+        )
 
         # The assertion is a failure and the double-failure teardown is a
         # separate error: two distinct entries, neither swallowing the other.
         self.assertEqual(len(result.failures), 1)
         self.assertEqual(len(result.errors), 1)
-        # The racer deleted the tree for real; no debris survives.
+        # The simulation deleted nothing on disk; the helper's recovery
+        # then removed the tree for real.  No debris survives.
         for path in list(_SIMULATED_PATHS):
             self.assertFalse(path.exists())
 
