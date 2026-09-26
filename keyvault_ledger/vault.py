@@ -250,7 +250,19 @@ class Vault:
         return {} if parameters is None else dict(parameters)
 
     def load(self, key_id: str, version: int | None = None) -> bytes:
-        """Return the stored material for ``key_id`` (active version by default)."""
+        """Return the stored material for ``key_id`` (active version by default).
+
+        With ``version=None`` the active version is read.  Entry validation
+        matches the other per-version reads: the key id is checked first, so
+        an empty key id raises ``ValueError`` before the version is looked at,
+        and a non-integer version raises ``TypeError`` — bools and floats do
+        not count, even a float numerically equal to an existing version.
+        An unknown key or a genuine-int version that does not exist raises
+        ``KeyError``.
+        """
+        _check_key_id(key_id)
+        if version is not None:
+            _check_version(version)
         snapshot = self._snapshot
         entry = snapshot.get(key_id)
         if entry is None:

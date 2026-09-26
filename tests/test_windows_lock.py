@@ -797,18 +797,19 @@ class TestWindowsEntryContract(WindowsLockTestCase):
         for call in (
             lambda: vault.seal("", b"m"),
             lambda: vault.derive_seal("", b"pw", b"salt", 1, 1),
+            lambda: vault.load("", 1),
             lambda: vault.revoke("", 1),
             lambda: vault.set_active("", 1),
             lambda: vault.is_revoked("", 1),
             lambda: vault.revoked_versions(""),
-            lambda: vault.derivation(""),
+            lambda: vault.derivation("", 1),
         ):
             with self.assertRaises(ValueError):
                 call()
 
         # Non-integer version -> TypeError (bools and floats do not count).
-        # ``derivation`` is checked separately: a None version is legal
-        # there and resolves to the active version.
+        # ``load`` and ``derivation`` are checked separately: a None version
+        # is legal there and resolves to the active version.
         for bad_version in (True, False, 1.0, 2.5, "1", None, (1,)):
             with self.assertRaises(TypeError, msg=repr(bad_version)):
                 vault.revoke("k", bad_version)
@@ -818,7 +819,13 @@ class TestWindowsEntryContract(WindowsLockTestCase):
                 vault.set_active("k", bad_version)
         for bad_version in (True, False, 1.0, 2.5, "1", (1,)):
             with self.assertRaises(TypeError, msg=repr(bad_version)):
+                vault.load("k", bad_version)
+            with self.assertRaises(TypeError, msg=repr(bad_version)):
                 vault.derivation("k", bad_version)
+        # A float equal to an existing version still cannot read it.
+        with self.assertRaises(TypeError):
+            vault.load("k", 1.0)
+        self.assertEqual(vault.load("k", None), b"m")
         self.assertEqual(vault.derivation("k", None), {})
 
         # Unknown key or version -> KeyError.

@@ -1056,6 +1056,71 @@ class TestVersionEntryValidation(VaultTestCase):
         with self.assertRaises(TypeError):
             vault.revoke("never-sealed", True)
 
+    def test_load_non_int_version_raises_type_error_even_when_equal(self):
+        vault = self.open_vault()
+        vault.seal("k", b"v1")
+        vault.seal("k", b"v2")
+        manifest_before = self.disk_manifest()
+        # 1.0 and True compare equal (and hash equal) to the genuine int 1;
+        # they must still be rejected at the entry rather than read v1.
+        for bad in (1.0, 2.0, 2.5, True, False, "1", (1,)):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.load("k", bad)
+        # A bad version type is a TypeError even on an unknown key.
+        with self.assertRaises(TypeError):
+            vault.load("never-sealed", 1.0)
+        # The rejected reads changed nothing on disk or in the snapshot.
+        self.assertEqual(self.disk_manifest(), manifest_before)
+        self.assertEqual(vault.versions("k"), [1, 2])
+        self.assertEqual(vault.load("k", 1), b"v1")
+        self.assertEqual(vault.load("k", 2), b"v2")
+        self.assertEqual(vault.load("k"), b"v2")
+        self.assertEqual(vault.load("k", None), b"v2")
+
+    def test_load_empty_key_id_value_error_precedes_version_type(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        # Identifier is validated first, so a bad version type on an empty
+        # id is a ValueError, not a TypeError.
+        for bad in (1.0, True, "1", (1,), None, 1):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                vault.load("", bad)
+
+    def test_load_derivation_is_revoked_share_type_value_key_order(self):
+        vault = self.open_vault()
+        vault.seal("k", b"plain")
+        vault.derive_seal("d", b"pw", b"salt", 100, 16)
+        # Non-integer version -> TypeError on all three per-version reads.
+        for bad in (1.0, 2.5, True, False, "1", (1,)):
+            with self.assertRaises(TypeError, msg=f"load {bad!r}"):
+                vault.load("k", bad)
+            with self.assertRaises(TypeError, msg=f"derivation {bad!r}"):
+                vault.derivation("k", bad)
+            with self.assertRaises(TypeError, msg=f"is_revoked {bad!r}"):
+                vault.is_revoked("k", bad)
+        # Empty id -> ValueError first, regardless of the version.
+        for bad in (1.0, True):
+            with self.assertRaises(ValueError):
+                vault.load("", bad)
+            with self.assertRaises(ValueError):
+                vault.derivation("", bad)
+            with self.assertRaises(ValueError):
+                vault.is_revoked("", bad)
+        # Genuine int, unknown key/version -> KeyError on all three.
+        with self.assertRaises(KeyError):
+            vault.load("ghost", 1)
+        with self.assertRaises(KeyError):
+            vault.derivation("ghost", 1)
+        with self.assertRaises(KeyError):
+            vault.is_revoked("ghost", 1)
+        for missing in (0, 5):
+            with self.assertRaises(KeyError):
+                vault.load("k", missing)
+            with self.assertRaises(KeyError):
+                vault.derivation("d", missing)
+            with self.assertRaises(KeyError):
+                vault.is_revoked("k", missing)
+
 
 class TestMultiProcess(VaultTestCase):
     def _run_workers(self, workers: list[multiprocessing.Process]) -> None:

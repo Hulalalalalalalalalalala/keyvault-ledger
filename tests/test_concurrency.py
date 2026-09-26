@@ -1290,7 +1290,9 @@ class TestEntryPointContract(ConcurrencyTestCase):
         with self.assertRaises(ValueError):
             vault.revoked_versions("")
         with self.assertRaises(ValueError):
-            vault.derivation("")
+            vault.derivation("", 1)
+        with self.assertRaises(ValueError):
+            vault.load("", 1)
 
         # No entry produced a new version or a journal record.
         self.assertEqual(vault.versions("k"), [1])
@@ -1363,6 +1365,48 @@ class TestEntryPointContract(ConcurrencyTestCase):
                 vault.is_revoked("k", bad_version)
             with self.assertRaises(KeyError, msg=str(bad_version)):
                 vault.derivation("d", bad_version)
+
+    def test_non_integer_version_raises_type_error_at_every_versioned_entry(self):
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        manifest_before = (self.root / MANIFEST_NAME).read_bytes()
+
+        # bools and floats do not count; 1.0 == 1 must not admit the read.
+        for bad_version in (1.0, 2.5, True, False, "1", (1,)):
+            with self.assertRaises(TypeError, msg=f"load {bad_version!r}"):
+                vault.load("k", bad_version)
+            with self.assertRaises(TypeError, msg=f"derivation {bad_version!r}"):
+                vault.derivation("k", bad_version)
+            with self.assertRaises(TypeError, msg=f"is_revoked {bad_version!r}"):
+                vault.is_revoked("k", bad_version)
+            with self.assertRaises(TypeError, msg=f"revoke {bad_version!r}"):
+                vault.revoke("k", bad_version)
+            with self.assertRaises(TypeError, msg=f"set_active {bad_version!r}"):
+                vault.set_active("k", bad_version)
+
+        # Entry validation precedes existence: a bad version type on an
+        # unknown key is TypeError, not KeyError.
+        with self.assertRaises(TypeError):
+            vault.load("never-sealed", 1.0)
+        with self.assertRaises(TypeError):
+            vault.derivation("never-sealed", True)
+        # The empty id check precedes the version type check: ValueError.
+        with self.assertRaises(ValueError):
+            vault.load("", 1.0)
+        with self.assertRaises(ValueError):
+            vault.derivation("", True)
+
+        # None is the active-version sentinel for load/derivation, not a
+        # rejected value; is_revoked has no sentinel and rejects it.
+        self.assertEqual(vault.load("k", None), b"m")
+        self.assertEqual(vault.derivation("k", None), {})
+        with self.assertRaises(TypeError):
+            vault.is_revoked("k", None)
+
+        # Every rejected call was read-only.
+        self.assertEqual(vault.versions("k"), [1])
+        self.assertEqual(vault.load("k"), b"m")
+        self.assertEqual((self.root / MANIFEST_NAME).read_bytes(), manifest_before)
 
     def test_duplicate_revoke_and_repoint_at_active_are_value_errors(self):
         vault = self.open_vault()

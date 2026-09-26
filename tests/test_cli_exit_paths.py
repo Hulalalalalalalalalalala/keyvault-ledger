@@ -936,6 +936,11 @@ class TestLibraryContractVocabulary(CliExitPathsTestCase):
             vault.set_active("", 1)
         with self.assertRaises(ValueError):
             vault.revoked_versions("")
+        # load checks the id first, before the version type.
+        with self.assertRaises(ValueError):
+            vault.load("", 1)
+        with self.assertRaises(ValueError):
+            vault.load("", 1.0)
 
     def test_non_integer_version_raises_type_error(self):
         vault = self.open()
@@ -944,6 +949,8 @@ class TestLibraryContractVocabulary(CliExitPathsTestCase):
         # version" sentinel, not a rejected value.
         for bad in (1.0, 2.5, True, False, "1"):
             with self.assertRaises(TypeError, msg=repr(bad)):
+                vault.load("k", bad)
+            with self.assertRaises(TypeError, msg=repr(bad)):
                 vault.derivation("k", bad)
             with self.assertRaises(TypeError, msg=repr(bad)):
                 vault.revoke("k", bad)
@@ -951,9 +958,17 @@ class TestLibraryContractVocabulary(CliExitPathsTestCase):
                 vault.is_revoked("k", bad)
             with self.assertRaises(TypeError, msg=repr(bad)):
                 vault.set_active("k", bad)
+        # 1.0 == 1 must not let load return version 1's material.
+        with self.assertRaises(TypeError):
+            vault.load("k", 1.0)
+        self.assertEqual(vault.load("k", 1), b"m")
+        self.assertEqual(vault.load("k", None), b"m")
         with self.assertRaises(TypeError) as caught:
             vault.derivation("k", "1")
         self.assertEqual(str(caught.exception), "version must be an int")
+        with self.assertRaises(TypeError) as caught_load:
+            vault.load("k", "1")
+        self.assertEqual(str(caught_load.exception), "version must be an int")
 
     def test_unknown_key_or_version_raises_key_error(self):
         vault = self.open()
