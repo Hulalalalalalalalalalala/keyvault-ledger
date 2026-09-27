@@ -154,18 +154,43 @@ are library-only.
 
 ### Concurrency
 
-Multiple processes may share one vault directory. Opening, sealing,
-deriving, repointing, revoking and reloading all run under an exclusive,
-blocking file lock held on `vault.lock` inside the vault directory
-(standard-library `fcntl.flock`, or `msvcrt.locking` on Windows). A writer
-waits until it holds the lock and completes its whole record before
-releasing it, so interleaved seals, derives, repoints and revokes from
-different processes never duplicate or skip a version number and never
-overwrite historical material. A reload concurrent with a writer reads
-either the complete old records or the complete newly persisted ones. The
-lock file is only a mutual-exclusion device: it carries no key data and
-plays no part in validation. `close()` releases its handle; later
-operations reopen and relock transparently.
+Multiple processes (and the threads inside them) may share one vault
+directory. Opening, sealing, deriving, repointing, revoking and reloading
+all run under an exclusive, blocking file lock held on `vault.lock` inside
+the vault directory (standard-library `fcntl.flock`, or `msvcrt.locking`
+on Windows). A writer waits until it holds the lock and completes its
+whole record — material file, manifest replacement, or journal append —
+before releasing it; every other process waits until it holds the lock
+itself before it begins its own record. So interleaved seals, derives,
+repoints and revokes from different processes and threads allocate each
+key's version numbers strictly ascending, never duplicating or skipping
+one, and never overwrite or truncate historical material.
+
+A reload interleaved with a writer crosses only one visibility boundary:
+it holds the same lock for the whole read-and-validate pass — manifest,
+every material and both journals — and the validated snapshot is then
+swapped in as one object, so a reader resolves every query of an
+observation against either the complete old records or the complete newly
+persisted ones. A half-old, half-new intermediate state is never
+observable, and a reload can never resurrect an older snapshot or reuse a
+version number it carried.
+
+When that whole-vault validation fails, `reload()` raises `ValueError`
+and the swap never happens: the in-memory snapshot stays exactly as it
+was and keys already in hand remain readable, while the records on disk
+neither gain nor lose a byte. Repeating any query while the failure
+persists returns the same answer again, and a fresh opener on the same
+directory raises the same `ValueError`. Once the offending bytes are
+removed or corrected, another full `reload()` succeeds and the snapshot
+matches the disk records one to one.
+
+The lock file is only a mutual-exclusion device: it carries no key data
+and plays no part in validation — its bytes may be empty or arbitrary
+without affecting any read, write or reload. `close()` releases its
+handle, and another process can take the same lock immediately; repeated
+`close()` calls are harmless no-ops, and the next operation reopens the
+file and reacquires the lock transparently, with no observable change in
+behaviour.
 
 ## Tests
 
