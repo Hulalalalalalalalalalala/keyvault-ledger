@@ -167,6 +167,40 @@ lock file is only a mutual-exclusion device: it carries no key data and
 plays no part in validation. `close()` releases its handle; later
 operations reopen and relock transparently.
 
+### The reload/writer visibility boundary
+
+A writer holds the lock for its whole record: a process that is sealing,
+deriving, revoking or repointing completes its entire record — the material
+file plus the atomic manifest flip, or the journal append — before releasing
+the lock, and every other process waits for the lock before starting its own
+record. No observer can catch a half-written record: after any interleaving
+of seals, derives, revokes and repoints, each key's version numbers are
+still a strict 1..n sequence with no duplicates and no gaps, and historical
+material is never rewritten.
+
+A `reload()` interleaved with writers runs under the same lock, so it only
+ever observes the complete old records or the complete newly persisted ones.
+A half-old/half-new mixture — a manifest listing a version whose material is
+not yet stored, a journal line cut short, an old record sitting next to a
+new one from the same operation — is never visible.
+
+A reload that fails whole-vault validation raises `ValueError` and is
+strictly read-only, in both directions. The in-memory snapshot is kept
+untouched: keys already in hand stay readable and every query — versions,
+active version, materials, revocation markers, derivation parameters, the
+manifest copy — answers word-for-word as it did before the failure. The disk
+records are equally untouched: a failed reload neither appends, rewrites nor
+removes anything, so the persisted state matches its pre-failure content
+byte for byte. Once the corruption is removed, the next `reload()` succeeds
+again and the snapshot corresponds to the disk records one to one.
+
+`vault.lock` itself is only a mutual-exclusion device: its contents carry no
+key data and play no part in manifest, material or journal validation, so
+clearing or filling the file never changes any observable answer. `close()`
+returns the lock handle; calling it again is a harmless no-op, and the next
+operation reopens the file and reacquires the same lock with no observable
+change in behaviour.
+
 ## Tests
 
     python3 -m unittest discover -s tests -t .
