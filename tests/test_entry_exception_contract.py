@@ -6,11 +6,12 @@ type each bad input raises and the order in which the checks fire:
 
 * an empty key id raises ``ValueError`` at every entry that validates the
   key id -- ``seal``, ``derive_seal``, ``load``, ``derivation``,
-  ``revoke``, ``is_revoked``, ``revoked_versions`` and ``set_active`` --
-  and that check runs first, ahead of the version type check, the material
-  type check and the passphrase/salt/parameter checks (the one read with
-  no id gate, ``active``, treats the empty id as an unknown key and raises
-  ``KeyError``, which is pinned as baseline behaviour);
+  ``revoke``, ``is_revoked``, ``revoked_versions``, ``set_active`` and
+  ``active`` -- and that check runs first, ahead of the version type check,
+  the material type check and the passphrase/salt/parameter checks (the
+  active-version query was the one read whose empty id used to surface as
+  the ``KeyError`` of an unknown key; it now answers the same
+  ``ValueError`` as every other read entry);
 
 * a version that is not a genuine integer raises ``TypeError`` at
   ``load``, ``derivation``, ``is_revoked``, ``revoke`` and
@@ -142,18 +143,30 @@ class TestEmptyKeyIdIsValueErrorAndCheckedFirst(ExceptionContractTestCase):
             vault.revoked_versions("")
         with self.assertRaises(ValueError):
             vault.set_active("", 1)
-        # ``active`` is the one read without an empty-id gate: the empty
-        # id is an unknown key there and answers KeyError (pinned below).
+        with self.assertRaises(ValueError):
+            vault.active("")
 
-    def test_active_has_no_entry_validation_and_treats_empty_id_as_unknown(self):
-        # ``active`` performs no key-id validation: an empty (or any
-        # unknown) id is simply absent from the snapshot and so answers
-        # KeyError, exactly like an unknown non-empty id.  This is the
-        # baseline behaviour, pinned as-is.
+    def test_active_empty_id_is_value_error_like_every_other_read(self):
+        # ``active`` used to be the one read without an empty-id gate: the
+        # empty id answered KeyError like an unknown key.  It now shares the
+        # entry rule of every other read query: the empty id fails with
+        # ValueError before the snapshot is consulted.  The shared message
+        # comes with it.
+        vault = self.open_vault()
+        with self.assertRaises(ValueError) as caught:
+            vault.active("")
+        self.assertEqual(str(caught.exception), "key_id must not be empty")
+        # An empty id fails the same way on a vault that does carry keys:
+        # existing state must not change the classification.
+        vault.seal("k", b"m")
+        with self.assertRaises(ValueError):
+            vault.active("")
+
+    def test_active_unknown_non_empty_id_still_key_error(self):
+        # Only the empty-id classification changed: an unknown non-empty id
+        # at ``active`` keeps its KeyError, exactly like the other reads.
         vault = self.open_vault()
         vault.seal("k", b"m")
-        with self.assertRaises(KeyError):
-            vault.active("")
         with self.assertRaises(KeyError):
             vault.active("never-sealed")
 
@@ -194,6 +207,7 @@ class TestEmptyKeyIdIsValueErrorAndCheckedFirst(ExceptionContractTestCase):
             lambda: vault.load("", 1),
             lambda: vault.revoke("", 1),
             lambda: vault.set_active("", 1),
+            lambda: vault.active(""),
             lambda: vault.derive_seal("", b"pw", b"salt", 1, 1),
         ):
             with self.assertRaises(ValueError) as caught:
@@ -563,6 +577,7 @@ class TestExceptionMatrixIsDeterministicAndReadOnly(ExceptionContractTestCase):
             lambda: vault.set_active("k", 1.0),
             lambda: vault.revoked_versions(""),
             lambda: vault.active(""),
+            lambda: vault.active("never-sealed"),
         )
         expected = [
             ValueError,   # seal empty id (precedes material type)
@@ -590,7 +605,8 @@ class TestExceptionMatrixIsDeterministicAndReadOnly(ExceptionContractTestCase):
             KeyError,     # repoint missing version
             TypeError,    # repoint float version
             ValueError,   # revoked listing empty id
-            KeyError,     # active has no id gate: empty id is unknown
+            ValueError,   # active empty id now matches the other reads
+            KeyError,     # active unknown non-empty id stays KeyError
         ]
 
         def run() -> list:

@@ -70,7 +70,9 @@ untouched.
 ### Active version
 
 Normally the active version is the most recently sealed one, and `load` and
-`derivation` without a version number resolve to it. `set_active(key_id,
+`derivation` without a version number resolve to it. `active` follows the
+read semantics of the other queries: an empty key id raises `ValueError`
+and an unknown key raises `KeyError`. `set_active(key_id,
 version)` repoints the active version at any existing historical version:
 afterwards `active` reports that version and unversioned `load` /
 `derivation` resolve to it, while versioned reads are unchanged. Each call

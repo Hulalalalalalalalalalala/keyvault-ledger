@@ -284,8 +284,12 @@ class Vault:
         """Return the active version of ``key_id``.
 
         Normally the most recently sealed version; ``set_active`` can repoint
-        it at an older historical version until the next seal.
+        it at an older historical version until the next seal.  Entry
+        validation matches the other reads: an empty key id raises
+        ``ValueError`` before the snapshot is looked at, while an unknown
+        non-empty id raises ``KeyError``.
         """
+        _check_key_id(key_id)
         entry = self._snapshot.get(key_id)
         if entry is None:
             raise KeyError(key_id)
