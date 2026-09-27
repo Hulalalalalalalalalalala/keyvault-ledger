@@ -4,13 +4,13 @@ The baseline vault already implements every entry point; this module adds
 no product behaviour.  It nails down, one case per rule, *which* exception
 type each bad input raises and the order in which the checks fire:
 
-* an empty key id raises ``ValueError`` at every entry that validates the
-  key id -- ``seal``, ``derive_seal``, ``load``, ``derivation``,
+* an empty key id raises ``ValueError`` at every entry that takes a key
+  id -- ``seal``, ``derive_seal``, ``load``, ``derivation``, ``active``,
   ``revoke``, ``is_revoked``, ``revoked_versions`` and ``set_active`` --
   and that check runs first, ahead of the version type check, the material
   type check and the passphrase/salt/parameter checks (the one read with
-  no id gate, ``active``, treats the empty id as an unknown key and raises
-  ``KeyError``, which is pinned as baseline behaviour);
+  no id gate, ``versions``, treats the empty id like an unknown key and
+  returns an empty list, which is pinned as baseline behaviour);
 
 * a version that is not a genuine integer raises ``TypeError`` at
   ``load``, ``derivation``, ``is_revoked``, ``revoke`` and
@@ -142,17 +142,29 @@ class TestEmptyKeyIdIsValueErrorAndCheckedFirst(ExceptionContractTestCase):
             vault.revoked_versions("")
         with self.assertRaises(ValueError):
             vault.set_active("", 1)
-        # ``active`` is the one read without an empty-id gate: the empty
-        # id is an unknown key there and answers KeyError (pinned below).
+        with self.assertRaises(ValueError):
+            vault.active("")
+        # ``versions`` is the one read with no empty-id gate: the empty id
+        # is an unknown key there and answers [], exactly like an unknown
+        # non-empty id (pinned below).
 
-    def test_active_has_no_entry_validation_and_treats_empty_id_as_unknown(self):
-        # ``active`` performs no key-id validation: an empty (or any
-        # unknown) id is simply absent from the snapshot and so answers
-        # KeyError, exactly like an unknown non-empty id.  This is the
+    def test_versions_has_no_entry_validation_and_treats_empty_id_as_unknown(self):
+        # ``versions`` performs no key-id validation: an empty (or any
+        # unknown) id is simply absent from the snapshot and so answers an
+        # empty list, exactly like an unknown non-empty id.  This is the
         # baseline behaviour, pinned as-is.
         vault = self.open_vault()
         vault.seal("k", b"m")
-        with self.assertRaises(KeyError):
+        self.assertEqual(vault.versions(""), [])
+        self.assertEqual(vault.versions("never-sealed"), [])
+
+    def test_active_empty_id_is_value_error_like_the_other_reads(self):
+        # ``active`` shares the entry validation of every other read: the
+        # empty id fails with ValueError at the entry before the snapshot is
+        # consulted, while an unknown non-empty id stays a KeyError.
+        vault = self.open_vault()
+        vault.seal("k", b"m")
+        with self.assertRaises(ValueError):
             vault.active("")
         with self.assertRaises(KeyError):
             vault.active("never-sealed")
@@ -195,6 +207,7 @@ class TestEmptyKeyIdIsValueErrorAndCheckedFirst(ExceptionContractTestCase):
             lambda: vault.revoke("", 1),
             lambda: vault.set_active("", 1),
             lambda: vault.derive_seal("", b"pw", b"salt", 1, 1),
+            lambda: vault.active(""),
         ):
             with self.assertRaises(ValueError) as caught:
                 call()
@@ -564,8 +577,7 @@ class TestExceptionMatrixIsDeterministicAndReadOnly(ExceptionContractTestCase):
             lambda: vault.revoked_versions(""),
             lambda: vault.active(""),
         )
-        expected = [
-            ValueError,   # seal empty id (precedes material type)
+        expected = [            ValueError,   # seal empty id (precedes material type)
             TypeError,    # seal non-bytes material
             ValueError,   # derive_seal empty id
             TypeError,    # password not bytes
@@ -590,7 +602,7 @@ class TestExceptionMatrixIsDeterministicAndReadOnly(ExceptionContractTestCase):
             KeyError,     # repoint missing version
             TypeError,    # repoint float version
             ValueError,   # revoked listing empty id
-            KeyError,     # active has no id gate: empty id is unknown
+            ValueError,   # active empty id, same gate as every other read
         ]
 
         def run() -> list:

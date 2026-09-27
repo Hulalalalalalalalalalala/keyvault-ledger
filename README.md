@@ -89,7 +89,11 @@ was pointed at is not an error — revocation never moves the active pointer.
 `set_active` raises `ValueError` for an empty key id, for the version that
 is already active, and for a revoked target, `TypeError` for a non-integer
 version (floats, bools, …), and `KeyError` for a key that was never sealed
-or a version that does not exist. A failed call appends no record. On
+or a version that does not exist. A failed call appends no record. The
+`active` query follows the same entry rule as the other read queries: an
+empty key id raises `ValueError` and an unknown (non-empty) key raises
+`KeyError`; `versions` alone has no id gate and answers `[]` for an empty
+or unknown id. On
 `reload`, the journal is validated together with the manifest, every
 material and the revocation journal: a corrupt record or one pointing at a
 key/version that never existed makes the reload fail with `ValueError` while
