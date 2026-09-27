@@ -11,6 +11,14 @@ and validates the whole keyring, both journals included, and swaps the
 in-memory snapshot atomically; readers only ever see a complete old or
 complete new snapshot.
 
+Every manifest record points at its material file with one unified path
+writing on every platform: a path relative to the vault root, joined with
+forward slashes (``materials/<key>/<version>.bin``) — never a backslash,
+never a drive letter or absolute path, never a segment that wanders
+outside the vault.  ``reload()`` rejects a record whose ``file`` does not
+follow that convention, so a vault directory travels between systems
+without its records changing meaning.
+
 Besides direct sealing (``seal``), a version's material may be derived from
 a passphrase with PBKDF2-HMAC-SHA256 (``derive_seal``).  The passphrase
 itself is never persisted: only the derived bytes go through the ordinary
@@ -42,7 +50,7 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 try:
     import fcntl
@@ -95,6 +103,29 @@ def _check_key_id(key_id: str) -> None:
         raise TypeError("key_id must be a string")
     if key_id == "":
         raise ValueError("key_id must not be empty")
+
+
+def _check_rel_file(rel_file: object, label: str) -> str:
+    """Validate a manifest ``file`` path against the unified convention.
+
+    Every record is written as a path relative to the vault root, joined
+    with forward slashes on every platform.  Anything else — a backslash,
+    a drive letter or UNC share, an absolute path, or an empty, ``.`` or
+    ``..`` segment — is not a path this vault could have written and is
+    rejected with ``ValueError``; ``label`` identifies the record in the
+    complaint.
+    """
+    if not isinstance(rel_file, str):
+        raise ValueError(f"manifest format invalid: {label} has bad file")
+    segments = rel_file.split("/")
+    if (
+        "\\" in rel_file
+        or PurePosixPath(rel_file).is_absolute()
+        or PureWindowsPath(rel_file).drive != ""
+        or any(segment in ("", ".", "..") for segment in segments)
+    ):
+        raise ValueError(f"manifest format invalid: {label} has bad file")
+    return rel_file
 
 
 def _check_version(version: int) -> None:
@@ -663,7 +694,6 @@ class Vault:
                     )
                 version = record.get("version")
                 digest = record.get("sha256")
-                rel_file = record.get("file")
                 if type(version) is not int or version <= previous:
                     raise ValueError(
                         f"manifest format invalid: key {key_id!r} versions "
@@ -679,11 +709,10 @@ class Vault:
                         f"manifest format invalid: key {key_id!r} version "
                         f"{version} has bad sha256"
                     )
-                if not isinstance(rel_file, str):
-                    raise ValueError(
-                        f"manifest format invalid: key {key_id!r} version "
-                        f"{version} has bad file"
-                    )
+                rel_file = _check_rel_file(
+                    record.get("file"),
+                    f"key {key_id!r} version {version}",
+                )
                 resolved = (self._root / rel_file).resolve()
                 if not resolved.is_relative_to(root_resolved):
                     raise ValueError(
