@@ -1,7 +1,12 @@
 """Append-only local key vault.
 
 The vault persists an append-only version manifest (``manifest.json``) plus
-one material file per sealed version under ``materials/``.  Revocations live
+one material file per sealed version under ``materials/``.  Each manifest
+record points at its material file with a path relative to the vault root
+written with forward slashes as the only separator -- the same spelling on
+every platform, with no drive letters, no absolute paths and no directories
+outside the vault, so a record always resolves to the same material file
+wherever the vault directory is opened.  Revocations live
 in their own append-only journal (``revocations.jsonl``): revoking a version
 only appends a record, never deleting or altering historical material.
 Repointing the active version (``set_active``) likewise appends one record
@@ -87,6 +92,28 @@ def _atomic_write(path: Path, data: bytes) -> None:
 
 def _dump_manifest(manifest: dict) -> bytes:
     return (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _is_canonical_rel_file(rel_file: str) -> bool:
+    """Whether a manifest ``file`` value is in the single portable form.
+
+    Every material pointer the vault writes is a path relative to the
+    vault root with forward slashes as the only separator: no backslashes
+    (even on platforms whose native separator is the backslash), no drive
+    letter or other ``:`` construct, no absolute or current/parent
+    directory segments.  Only this one form parses to the same file on
+    every platform, so anything else in a record is rejected.
+    """
+    if (
+        rel_file == ""
+        or "\\" in rel_file
+        or ":" in rel_file
+        or rel_file.startswith("/")
+    ):
+        return False
+    return all(
+        segment not in ("", ".", "..") for segment in rel_file.split("/")
+    )
 
 
 def _check_key_id(key_id: str) -> None:
@@ -679,7 +706,9 @@ class Vault:
                         f"manifest format invalid: key {key_id!r} version "
                         f"{version} has bad sha256"
                     )
-                if not isinstance(rel_file, str):
+                if not isinstance(rel_file, str) or not _is_canonical_rel_file(
+                    rel_file
+                ):
                     raise ValueError(
                         f"manifest format invalid: key {key_id!r} version "
                         f"{version} has bad file"
